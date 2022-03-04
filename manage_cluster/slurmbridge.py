@@ -1,12 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from email import message
-from importlib.resources import Resource
+import dataclasses
+from functools import cached_property
 import re
 import subprocess
 import shutil
-from typing import Dict, Generic, List, Mapping, Optional, Sequence, Type, TypeVar
+from sys import stderr
+from typing import (
+    Any,
+    Dict,
+    Generic,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    TypeVar,
+)
+from xml.dom.minidom import Attr
 
 SACCTMGR_PATH = shutil.which("sacctmgr")
 
@@ -17,6 +28,10 @@ def camel_to_snake_case(input: str) -> str:
 
 def snake_to_camel_case(input: str) -> str:
     return "".join([part.title() for part in input.split("_")])
+
+
+class SlurmAccountManagerError(Exception):
+    pass
 
 
 class SlurmResourceException(Exception):
@@ -35,28 +50,43 @@ class MultipleObjectReturned(SlurmResourceException):
     pass
 
 
-class PrimaryStringField(str):
+class ReadOnlyStringField(str):
+    pass
+
+
+class PrimaryStringField(ReadOnlyStringField):
     pass
 
 
 ResourceType = TypeVar("ResourceType")
 
 
-@dataclass
+@dataclasses.dataclass
 class SlurmResource(Generic[ResourceType]):
-    def __init_subclass__(cls) -> None:
-        super().__init_subclass__()
+    def __setattr__(self, __name: str, __value: Any) -> None:
+        if hasattr(self, __name) and __name in self._read_only_fields:
+            raise AttributeError(f"{__name} is a reead-only field")
+        return super().__setattr__(__name, __value)
 
-        pk_fields: List[str] = []
-        for field_name, type_name in cls.__annotations__.items():
-            if type_name == PrimaryStringField.__name__:
-                pk_fields.append(field_name)
+    @cached_property
+    def _primary_key_fields(self) -> Sequence[str]:
+        pk_field_types = [PrimaryStringField, *PrimaryStringField.__subclasses__()]
+        pk_field_type_names = [cls.__name__ for cls in pk_field_types]
+        return [
+            field.name
+            for field in dataclasses.fields(self)
+            if field.type in pk_field_type_names
+        ]
 
-        if len(pk_fields) == 0:
-            raise AssertionError(
-                "You need to specify at least one field with type PrimaryStringField"
-            )
-        setattr(cls, "_primary_key_fields", pk_fields)
+    @cached_property
+    def _read_only_fields(self) -> Sequence[str]:
+        ro_field_types = [ReadOnlyStringField, *ReadOnlyStringField.__subclasses__()]
+        ro_field_type_names = [cls.__name__ for cls in ro_field_types]
+        return [
+            field.name
+            for field in dataclasses.fields(self)
+            if field.type in ro_field_type_names
+        ]
 
     @classmethod
     def _run_scattmgr_command(
@@ -75,8 +105,12 @@ class SlurmResource(Generic[ResourceType]):
             ],
             capture_output=True,
             timeout=5,
-            # check=True,
         )
+
+        if process.returncode != 0:
+            error_message = process.stderr if len(process.stderr)>0 else process.stdout
+            raise SlurmAccountManagerError(error_message.decode("ascii"))
+
         return process.stdout.decode("ascii")
 
     @classmethod
@@ -106,7 +140,7 @@ class SlurmResource(Generic[ResourceType]):
         cls,
         new_values: Mapping[str, str],
         filters: Mapping[str, str],
-    ) -> None:
+    ) -> Sequence[str]:
         filter_args: list[str] = []
         if len(filters) > 0:
             filter_args.append("where")
@@ -117,9 +151,11 @@ class SlurmResource(Generic[ResourceType]):
         for field_name, new_value in new_values.items():
             update_args.append(f"{field_name}={new_value}")
 
-        cls._run_scattmgr_command(
+        process_output = cls._run_scattmgr_command(
             "modify", cls.__name__, *filter_args, *update_args, "--immediate"
         )
+
+        return [entry.strip() for entry in process_output.splitlines()[1:]]
 
     @classmethod
     def _response_to_instances(
@@ -132,19 +168,22 @@ class SlurmResource(Generic[ResourceType]):
             instances.append(instance)
         return instances
 
-    def _to_query(self: ResourceType) -> Dict[str, str]:
-        query_fields: Dict[str, str] = {}
+    def _to_query(self) -> Tuple[Dict[str, str], Dict[str, str]]:
+        update_fields: Dict[str, str] = {}
+        filter_fields: Dict[str, str] = {}
 
-        for field, value in self.__dict__.items():
-            query_fields[snake_to_camel_case(field)] = value
+        for field, value in dataclasses.asdict(self).items():
+            if field in self._primary_key_fields:
+                filter_fields[snake_to_camel_case(field)] = value
+            elif field not in self._read_only_fields:
+                update_fields[snake_to_camel_case(field)] = value
 
-        return query_fields
+        return update_fields, filter_fields
 
     @classmethod
     def filter(cls, **filters: str) -> Sequence[ResourceType]:
         resource_fields = [
-            snake_to_camel_case(field_name)
-            for field_name in cls.__dataclass_fields__.keys()
+            snake_to_camel_case(field.name) for field in dataclasses.fields(cls)
         ]
         user_data = cls._scattmgr_show(
             resource_fields,
@@ -166,29 +205,21 @@ class SlurmResource(Generic[ResourceType]):
         return user_list[0]
 
     def save(self):
-        params = self._to_query()
-        pk_fields = self.__class__._primary_key_fields
-        pk_field_row_names = [
-            snake_to_camel_case(field_name) for field_name in pk_fields
-        ]
-
-        # remove the pk fields as we can't update those
-        for pk_in_query in pk_field_row_names:
-            params.pop(pk_in_query)
-
-        print(params)
-        self._scattmgr_modify(
-            params, {field: getattr(self, field) for field in pk_fields}
-        )
+        updates, filters = self._to_query()
+        updated_keys = self._scattmgr_modify(updates, filters)
+        if len(updated_keys) != 1:
+            raise AssertionError(
+                f"Modified more than a single Object!. Modified keys: {updated_keys}"
+            )
 
 
-@dataclass
+@dataclasses.dataclass
 class User(SlurmResource["User"]):
     user: PrimaryStringField
     default_account: str
 
 
-@dataclass
+@dataclasses.dataclass
 class Association(SlurmResource["Association"]):
     cluster: PrimaryStringField
     account: PrimaryStringField
@@ -199,7 +230,6 @@ class Association(SlurmResource["Association"]):
     grp_submit: str
     grp_tres_mins: str
     grp_wall: str
-    grp_tres: str
     max_jobs: str
     max_tres_per_job: str
     max_tres_per_node: str
