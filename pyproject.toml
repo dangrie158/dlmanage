@@ -6,6 +6,8 @@ authors = ["Griesshaber Daniel <griesshaber@hdm-stuttgart.de>"]
 
 [tool.poetry.dependencies]
 python = "^3.9"
+textual = "^0.1.15"
+rich = "^11.2.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "^5.2"
