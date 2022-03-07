@@ -5,7 +5,6 @@ from functools import cached_property
 import re
 import subprocess
 import shutil
-from sys import stderr
 from typing import (
     Any,
     Dict,
@@ -17,7 +16,6 @@ from typing import (
     Type,
     TypeVar,
 )
-from xml.dom.minidom import Attr
 
 SACCTMGR_PATH = shutil.which("sacctmgr")
 
@@ -28,6 +26,43 @@ def camel_to_snake_case(input: str) -> str:
 
 def snake_to_camel_case(input: str) -> str:
     return "".join([part.title() for part in input.split("_")])
+
+
+def get_gres_value(haystack: str, needle: str) -> Optional[str]:
+    if haystack is None:
+        return None
+
+    parts = haystack.split(",")
+    for kv_pair in parts:
+        if "=" not in kv_pair:
+            continue
+
+        key, value = kv_pair.split("=")
+        if key == needle:
+            return value
+
+    return None
+
+
+def update_gres_value(haystack: str, needle: str, new_value: str) -> str:
+    if haystack is None:
+        haystack = ""
+
+    new_haystack_parts: list[str] = []
+    parts = haystack.split(",")
+    for kv_pair in parts:
+        if "=" not in kv_pair:
+            continue
+
+        key, current_value = kv_pair.split("=")
+        value = new_value if key == needle else current_value
+        new_haystack_parts.append(f"{key}={value}")
+
+    # if we could not update an old value, add a new entry
+    if needle not in haystack:
+        new_haystack_parts.append(f"{needle}={new_value}")
+
+    return ",".join(new_haystack_parts)
 
 
 class SlurmAccountManagerError(Exception):
@@ -58,14 +93,14 @@ class PrimaryStringField(ReadOnlyStringField):
     pass
 
 
-ResourceType = TypeVar("ResourceType")
+ResourceType = TypeVar("ResourceType", bound="SlurmResource")
 
 
 @dataclasses.dataclass
 class SlurmResource(Generic[ResourceType]):
     def __setattr__(self, __name: str, __value: Any) -> None:
         if hasattr(self, __name) and __name in self._read_only_fields:
-            raise AttributeError(f"{__name} is a reead-only field")
+            raise AttributeError(f"{__name} is a read-only field")
         return super().__setattr__(__name, __value)
 
     @cached_property
@@ -91,7 +126,9 @@ class SlurmResource(Generic[ResourceType]):
     @classmethod
     def _run_scattmgr_command(
         cls,
+        verb: str,
         *arguments: str,
+        error_ok=False,
     ) -> str:
         if SACCTMGR_PATH is None:
             raise ImportError("sacctmgr could not be found in path.")
@@ -99,6 +136,7 @@ class SlurmResource(Generic[ResourceType]):
         process = subprocess.run(
             args=[
                 SACCTMGR_PATH,
+                verb,
                 *arguments,
                 "--parsable2",  # seperate values by a PIPE
                 "--noheader",
@@ -107,11 +145,14 @@ class SlurmResource(Generic[ResourceType]):
             timeout=5,
         )
 
-        if process.returncode != 0:
-            error_message = process.stderr if len(process.stderr)>0 else process.stdout
-            raise SlurmAccountManagerError(error_message.decode("ascii"))
+        process_output = (
+            process.stderr if len(process.stderr) > 0 else process.stdout
+        ).decode("ascii")
 
-        return process.stdout.decode("ascii")
+        if not error_ok and process.returncode != 0:
+            raise SlurmAccountManagerError(process_output)
+
+        return process_output
 
     @classmethod
     def _scattmgr_show(
@@ -136,8 +177,9 @@ class SlurmResource(Generic[ResourceType]):
         ]
 
     @classmethod
-    def _scattmgr_modify(
+    def _scattmgr_write(
         cls,
+        verb: str,
         new_values: Mapping[str, str],
         filters: Mapping[str, str],
     ) -> Sequence[str]:
@@ -147,23 +189,50 @@ class SlurmResource(Generic[ResourceType]):
             for column, value in filters.items():
                 filter_args.append(f"{column}={value}")
 
-        update_args: list[str] = ["set"]
-        for field_name, new_value in new_values.items():
-            update_args.append(f"{field_name}={new_value}")
+        update_args: list[str] = []
+        if len(new_values) > 0:
+            update_args.append("set")
+            for field_name, new_value in new_values.items():
+                update_args.append(f"{field_name}={new_value}")
 
         process_output = cls._run_scattmgr_command(
-            "modify", cls.__name__, *filter_args, *update_args, "--immediate"
+            verb, cls.__name__, *filter_args, *update_args, "--immediate", error_ok=True
         )
 
-        return [entry.strip() for entry in process_output.splitlines()[1:]]
+        if "Nothing new added." in process_output:
+            return []
+
+        modified_objects = []
+        # the processoutput is grouped into one or more sections where
+        # the first section always lists the modified objects and other
+        # sections may list related modifications
+        section = 0
+        for line in process_output.splitlines():
+            # section headers are formatted like: "Modified <objecttype>..."
+            if line.endswith("..."):
+                section += 1
+                continue
+            if section == 1:
+                modified_objects.append(line.strip())
+            else:
+                break
+
+        return modified_objects
 
     @classmethod
     def _response_to_instances(
         cls: Type[ResourceType], response: Sequence[Dict[str, str]]
     ) -> Sequence[ResourceType]:
         instances: list[ResourceType] = []
+        empty_variants = ("0-00:00:00", "", "0", "00:00:00")
         for data in response:
-            attrs = {camel_to_snake_case(key): value for key, value in data.items()}
+            attrs = {
+                # some values will always return a value although they are empty
+                # we need to ignore them here to make sure not to set these values
+                # when saving the object again
+                camel_to_snake_case(key): value if value not in empty_variants else None
+                for key, value in data.items()
+            }
             instance = cls(**attrs)
             instances.append(instance)
         return instances
@@ -175,7 +244,7 @@ class SlurmResource(Generic[ResourceType]):
         for field, value in dataclasses.asdict(self).items():
             if field in self._primary_key_fields:
                 filter_fields[snake_to_camel_case(field)] = value
-            elif field not in self._read_only_fields:
+            elif field not in self._read_only_fields and value:
                 update_fields[snake_to_camel_case(field)] = value
 
         return update_fields, filter_fields
@@ -185,11 +254,11 @@ class SlurmResource(Generic[ResourceType]):
         resource_fields = [
             snake_to_camel_case(field.name) for field in dataclasses.fields(cls)
         ]
-        user_data = cls._scattmgr_show(
+        object_data = cls._scattmgr_show(
             resource_fields,
             filters,
         )
-        return cls._response_to_instances(user_data)
+        return cls._response_to_instances(object_data)
 
     @classmethod
     def all(cls) -> Sequence[ResourceType]:
@@ -204,19 +273,84 @@ class SlurmResource(Generic[ResourceType]):
             raise MultipleObjectReturned(cls)
         return user_list[0]
 
-    def save(self):
+    @classmethod
+    def create(cls: Type[ResourceType], **attrs) -> ResourceType:
+        new_object = cls(**attrs)
+        created = new_object.save()
+        if not created:
+            raise AssertionError(
+                f"Failed to create new {cls.__name__}. Maybe the object already existed?"
+            )
+        return new_object
+
+    def save(self) -> bool:
+        created = False
         updates, filters = self._to_query()
-        updated_keys = self._scattmgr_modify(updates, filters)
-        if len(updated_keys) != 1:
+
+        updated_keys = self._scattmgr_write("modify", updates, filters)
+        if len(updated_keys) == 0:
+            # the object was not yet present in the db, create a new one
+            self._scattmgr_write("create", updates | filters, {})
+            created = True
+        elif len(updated_keys) > 1:
             raise AssertionError(
                 f"Modified more than a single Object!. Modified keys: {updated_keys}"
             )
+
+        new_object = self.get(**filters)
+        for field in dataclasses.fields(new_object):
+            del self.__dict__[field.name]
+            setattr(self, field.name, getattr(new_object, field.name))
+
+        return created
+
+    def delete(self) -> bool:
+        _, filters = self._to_query()
+
+        updated_keys = self._scattmgr_write("delete", {}, filters)
+        if len(updated_keys) > 1:
+            raise AssertionError(
+                f"Deleted more than a single Object!. Deleted keys: {updated_keys}"
+            )
+
+        return len(updated_keys) == 1
 
 
 @dataclasses.dataclass
 class User(SlurmResource["User"]):
     user: PrimaryStringField
     default_account: str
+    grp_tres_mins: Optional[str] = None
+    grp_tres_run_mins: Optional[str] = None
+    grp_tres: Optional[str] = None
+    grp_jobs: Optional[str] = None
+    grp_submit_jobs: Optional[str] = None
+    grp_wall: Optional[str] = None
+    max_tres_mins_per_job: Optional[str] = None
+    max_tres_per_job: Optional[str] = None
+    max_tres_per_node: Optional[str] = None
+    max_wall_duration_per_job: Optional[str] = None
+    # Association specific
+    fairshare: Optional[str] = None
+    max_jobs: Optional[str] = None
+    max_submit_jobs: Optional[str] = None
+    qos: Optional[str] = None
+
+    @property
+    def max_gpus(self):
+        return get_gres_value(self.grp_tres, "gres/gpu")
+
+    @max_gpus.setter
+    def max_gpus(self, new_val):
+        self.grp_tres = update_gres_value(self.grp_tres, "gres/gpu", new_val)
+
+    @property
+    def max_cpus(self):
+        return get_gres_value(self.grp_tres, "cpu")
+
+    @max_cpus.setter
+    def max_cpus(self, new_val):
+        self.grp_tres = update_gres_value(self.grp_tres, "cpu", new_val)
 
 
 @dataclasses.dataclass
@@ -226,11 +360,40 @@ class Association(SlurmResource["Association"]):
     user: PrimaryStringField
     partition: str
     grp_jobs: str
-    grp_tres: str
-    grp_submit: str
-    grp_tres_mins: str
+    grp_submit_jobs: str
     grp_wall: str
-    max_jobs: str
+    max_tres_mins_per_job: str
     max_tres_per_job: str
     max_tres_per_node: str
-    default_qos: str
+    max_wall_duration_per_job: str
+    # Association specific
+    fairshare: str
+    max_jobs: str
+    max_submit_jobs: str
+    qos: str
+
+
+@dataclasses.dataclass
+class QOS(SlurmResource["QOS"]):
+    user: PrimaryStringField
+    default_account: str
+    grp_tres_mins: str
+    grp_tres_run_mins: str
+    grp_tres: str
+    grp_jobs: str
+    grp_submit_jobs: str
+    grp_wall: str
+    max_tres_mins_per_job: str
+    max_tres_per_job: str
+    max_tres_per_node: str
+    max_wall_duration_per_job: str
+    max_prio_threshold: str
+    # QOS specific
+    max_jobs_accure_per_account: str
+    max_jobs_accure_per_user: str
+    max_jobs_per_account: str
+    max_jobs_per_user: str
+    max_submit_jobs_per_account: str
+    max_submit_jobs_per_user: str
+    max_tres_per_account: str
+    max_tres_per_user: str
