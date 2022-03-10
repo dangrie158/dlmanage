@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import dataclasses
+from datetime import datetime
 from functools import cached_property
+from glob import glob
+import os
 import re
 import subprocess
 import shutil
@@ -63,6 +66,22 @@ def update_gres_value(haystack: str, needle: str, new_value: str) -> str:
         new_haystack_parts.append(f"{needle}={new_value}")
 
     return ",".join(new_haystack_parts)
+
+
+def find_home_directory(username: str) -> str | None:
+    if len(username) == 0:
+        return None
+
+    patterns = (
+        f"/home/stud/{username[0]}/{username}",
+        f"/home/ma/{username[0]}/{username}",
+        f"/home/*/{username}/",
+    )
+    for candidate_pattern in patterns:
+        candidates = glob(candidate_pattern)
+        if len(candidates) > 0:
+            return candidates[0]
+    return None
 
 
 class SlurmAccountManagerError(Exception):
@@ -320,6 +339,46 @@ class SlurmResource(Generic[ResourceType]):
 class User(SlurmResource["User"]):
     user: PrimaryStringField
     default_account: str
+    grp_tres_mins: Optional[str] = None
+    grp_tres_run_mins: Optional[str] = None
+    grp_tres: Optional[str] = None
+    grp_jobs: Optional[str] = None
+    grp_submit_jobs: Optional[str] = None
+    grp_wall: Optional[str] = None
+    max_tres_mins_per_job: Optional[str] = None
+    max_tres_per_job: Optional[str] = None
+    max_tres_per_node: Optional[str] = None
+    max_wall_duration_per_job: Optional[str] = None
+    # Association specific
+    fairshare: Optional[str] = None
+    max_jobs: Optional[str] = None
+    max_submit_jobs: Optional[str] = None
+    qos: Optional[str] = None
+
+    @property
+    def max_gpus(self):
+        return get_gres_value(self.grp_tres, "gres/gpu")
+
+    @max_gpus.setter
+    def max_gpus(self, new_val):
+        self.grp_tres = update_gres_value(self.grp_tres, "gres/gpu", new_val)
+
+    @property
+    def max_cpus(self):
+        return get_gres_value(self.grp_tres, "cpu")
+
+    @max_cpus.setter
+    def max_cpus(self, new_val):
+        self.grp_tres = update_gres_value(self.grp_tres, "cpu", new_val)
+
+    @cached_property
+    def home_directory(self) -> str | None:
+        return find_home_directory(self.user)
+
+
+@dataclasses.dataclass
+class Account(SlurmResource["User"]):
+    account: PrimaryStringField
     grp_tres_mins: Optional[str] = None
     grp_tres_run_mins: Optional[str] = None
     grp_tres: Optional[str] = None
