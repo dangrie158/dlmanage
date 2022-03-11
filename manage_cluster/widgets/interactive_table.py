@@ -31,7 +31,10 @@ TablePosition = NamedTuple("TablePosition", (("column", str), ("row", int)))
 
 
 class TableTheme:
-    header = Style(color="#E08D6D")
+    cell = Style(color="gray62")
+    text_cell = Style(color="white")
+    int_cell = Style(color="green")
+    choice_cell = Style(color="green3")
     hovered_cell = Style(bold=True)
     hovered_editable_cell = Style(bold=True, underline=True)
     selected_row = Style(bgcolor="gray19")
@@ -51,7 +54,7 @@ class TableCell(Widget):
         position: TablePosition,
         text: Optional[str] = None,
         *,
-        style: Style = NULL_STYLE,
+        style: Optional[Style] = None,
         theme: Optional[TableTheme] = None,
         placeholder: str = "<undefined>",
     ):
@@ -60,6 +63,7 @@ class TableCell(Widget):
         self.placeholder = placeholder
         self.text = text
         self.theme = theme or TableTheme()
+        style = style or self.theme.cell
         self.base_style = style + Style(
             meta={"column": self.position.column, "row": self.position.row}
         )
@@ -80,10 +84,6 @@ class TableCell(Widget):
             style += self.theme.hovered_cell
 
         return Text(text, style=self.base_style + style)
-
-    async def refresh(self, repaint: bool = True, layout: bool = False) -> None:
-        super().refresh(repaint, layout)
-        await self.post_message("invalidate_cell")
 
     def focus(self):
         self.is_focused = True
@@ -106,19 +106,41 @@ class EditableTableCell(TableCell):
     cursor_position: Reactive[int] = Reactive(0, layout=True)
     value: Reactive[str] = Reactive("", layout=True)
 
+    def __init__(
+        self,
+        position: TablePosition,
+        text: Optional[str] = None,
+        *,
+        style: Optional[Style] = None,
+        theme: Optional[TableTheme] = None,
+        placeholder: str = "<undefined>",
+    ):
+        theme = theme or TableTheme()
+        style = style or theme.text_cell
+        super().__init__(
+            position, text, style=style, theme=theme, placeholder=placeholder
+        )
+
     async def begin_editing(self):
         self.value = self.text or " "
         self.is_editing = True
 
     async def abort_edit(self):
         self.is_editing = False
+        await self.emit(CellFinishedEditing(self, self.position))
 
     async def commit_edit(self):
         self.is_editing = False
+
         # to_value can throw to indicate an invalid value. only send an event if the conversion succeeds
-        with suppress(Exception):
-            value = self.to_value()
-            await self.post_message(CellEdited(self, self.position, self.to_value()))
+        try:
+            new_value = self.to_value()
+        except Exception:
+            pass
+        else:
+            await self.emit(CellEdited(self, self.position, new_value))
+
+        await self.emit(CellFinishedEditing(self, self.position))
 
     def to_value(self) -> Any:
         return self.value or None
@@ -173,9 +195,9 @@ class EditableTableCell(TableCell):
             case "right":
                 if self.cursor_position < len(self.value) - 1:
                     self.cursor_position += 1
-            case _:
-                if event.key.isprintable() and len(event.key) == 1:
-                    self.input_key(event.key)
+            case other:
+                if other.isprintable() and len(other) == 1:
+                    self.input_key(other)
 
 
 class EditableIntTableCell(EditableTableCell):
@@ -184,7 +206,7 @@ class EditableIntTableCell(EditableTableCell):
         position: TablePosition,
         text: Optional[str] = None,
         *,
-        style: Style = NULL_STYLE,
+        style: Optional[Style] = None,
         theme: Optional[TableTheme] = None,
         placeholder: str = "<undefined>",
         max_val: Optional[int] = None,
@@ -192,13 +214,16 @@ class EditableIntTableCell(EditableTableCell):
     ):
         self.min_val = min_val
         self.max_val = max_val
+
+        theme = theme or TableTheme()
+        style = style or theme.int_cell
         super().__init__(
             position, text, style=style, theme=theme, placeholder=placeholder
         )
 
     async def begin_editing(self):
-        self.value = self.text or "0"
-        self.cursor_position = len(self.value) - 1
+        self.value = self.text or ""
+        self.cursor_position = len(self.value)
         self.is_editing = True
 
     def to_value(self) -> Any:
@@ -219,9 +244,9 @@ class EditableIntTableCell(EditableTableCell):
                 with suppress(ValueError):
                     if self.min_val is None or self.to_value() > self.min_val:
                         self.value = str(int(self.value) - 1)
-            case _:
-                if key_name.isnumeric():
-                    super().input_key(key_name)
+            case other:
+                if other.isnumeric():
+                    super().input_key(other)
 
 
 class EditableChoiceTableCell(EditableTableCell):
@@ -230,12 +255,15 @@ class EditableChoiceTableCell(EditableTableCell):
         position: TablePosition,
         text: Optional[str] = None,
         *,
-        style: Style = NULL_STYLE,
+        style: Optional[Style] = None,
         theme: Optional[TableTheme] = None,
         placeholder: str = "<undefined>",
         choices: Optional[Sequence[str]] = None,
     ):
         self.choices = choices or [text]
+
+        theme = theme or TableTheme()
+        style = style or theme.choice_cell
         super().__init__(
             position, text, style=style, theme=theme, placeholder=placeholder
         )
@@ -252,7 +280,7 @@ class EditableChoiceTableCell(EditableTableCell):
                 if index == self.cursor_position:
                     style += self.theme.cursor
                 if choice == self.value:
-                    style += self.theme.focused_cell
+                    style += self.theme.choice_cell
 
                 selector = "◉" if choice == self.value else "○"
                 choice_list += Text(
@@ -291,7 +319,7 @@ class EditableChoiceTableCell(EditableTableCell):
                 if self.cursor_position > 0:
                     self.cursor_position -= 1
             case "down":
-                if self.cursor_position < len(self.choices):
+                if self.cursor_position < len(self.choices) - 1:
                     self.cursor_position += 1
             case "left" | "right":
                 return
@@ -313,6 +341,17 @@ class CellEdited(Message):
         yield "new_content", self.new_content
 
 
+@rich.repr.auto
+class CellFinishedEditing(Message):
+    def __init__(self, sender: MessageTarget, position: TablePosition) -> None:
+        self.position = position
+        super().__init__(sender)
+
+    def __rich_repr__(self) -> rich.repr.Result:
+        yield "position", self.position
+        yield "new_content", self.new_content
+
+
 class InteractiveTableModel(ABC):
     title: str
 
@@ -324,6 +363,18 @@ class InteractiveTableModel(ABC):
     def get_num_rows(self) -> int:
         ...
 
+    @abstractmethod
+    def on_cell_update(self, position: TablePosition, new_value: str) -> None:
+        ...
+
+    @abstractmethod
+    def on_row_delete(self, position: TablePosition) -> None:
+        ...
+
+    @abstractmethod
+    def on_row_add(self, position: TablePosition) -> None:
+        ...
+
     def get_column_kwargs(self, column_name: str) -> Mapping[str, Any]:
         return {}
 
@@ -333,8 +384,11 @@ class InteractiveTableModel(ABC):
         return TableCell, {}
 
     @abstractmethod
-    def get_cell(self, position: TablePosition) -> Tuple[str, Style]:
+    def get_cell(self, position: TablePosition) -> str:
         ...
+
+    def get_primary_column(self) -> str:
+        return list(self.get_columns())[0]
 
     def is_cell_editable(self, position: TablePosition) -> bool:
         try:
@@ -379,6 +433,18 @@ class InteractiveTableModel(ABC):
             pass
         return None
 
+    def get_next_row_matching(self, current_row: int, needle: str) -> int | None:
+        search_column = self.get_primary_column()
+
+        total_rows = self.get_num_rows()
+        candidates = list(range(current_row + 1, total_rows))
+        candidates += list(range(0, current_row))
+        for row in candidates:
+            value = self.get_cell(TablePosition(search_column, row))
+            if value.startswith(needle):
+                return row
+        return None
+
 
 class InteractiveTable(Widget):
     selection_position: Reactive[Optional[TablePosition]] = Reactive(None, layout=True)
@@ -393,18 +459,23 @@ class InteractiveTable(Widget):
         padding: PaddingDimensions = (1, 1),
         theme: TableTheme = TableTheme(),
     ) -> None:
-        self.model = model
         self.theme = theme
 
         self.cells: Dict[TablePosition, TableCell] = {}
         self.columns: Sequence[str] = []
         self.num_rows: int = 0
-        self.get_data_from_model()
+        self.model = model
+        self.refresh_data_from_model()
 
         super().__init__(name=name)
         self.padding = padding
 
-    def get_data_from_model(self):
+    async def set_model(self, new_model: InteractiveTableModel):
+        self.model = new_model
+        self.refresh_data_from_model()
+        self.refresh()
+
+    def refresh_data_from_model(self):
         # TODO: handle removing of old data
         #       and updating only cell content instead of the complete object
         self.num_rows = self.model.get_num_rows()
@@ -412,13 +483,14 @@ class InteractiveTable(Widget):
         for column in self.model.get_columns():
             for row in range(self.num_rows):
                 current_position = TablePosition(column, row)
-                cell_text, cell_style = self.model.get_cell(current_position)
+                cell_text = self.model.get_cell(current_position)
                 cell_class, cell_kwargs = self.model.get_cell_class(current_position)
                 cell = cell_class(
-                    current_position, cell_text, style=cell_style, **cell_kwargs
+                    current_position, cell_text, theme=self.theme, **cell_kwargs
                 )
                 for attr_name, attr_value in cell_kwargs.items():
                     setattr(cell, attr_name, attr_value)
+                cell.set_parent(self)
                 self.cells[current_position] = cell
 
     def watch_selection_position(
@@ -440,9 +512,7 @@ class InteractiveTable(Widget):
             self.cells[new_value].hover_enter()
 
     def render(self) -> Table:
-        table = Table(
-            expand=True,
-        )
+        table = Table(expand=True, highlight=True)
         for column in self.columns:
             column_kwargs = self.model.get_column_kwargs(column)
             table.add_column(column, **column_kwargs)
@@ -464,7 +534,7 @@ class InteractiveTable(Widget):
             table.add_row(*cells, style=row_style)
         return table
 
-    def on_click(self, event: events.Click) -> None:
+    async def on_click(self, event: events.Click) -> None:
         if self.is_in_edit_mode:
             return
         column, row = event.style.meta.get("column"), event.style.meta.get("row")
@@ -474,7 +544,7 @@ class InteractiveTable(Widget):
 
         self.selection_position = TablePosition(column, row)
 
-    def on_mouse_move(self, event: events.MouseMove) -> None:
+    async def on_mouse_move(self, event: events.MouseMove) -> None:
         column, row = event.style.meta.get("column"), event.style.meta.get("row")
         if None in (column, row):
             self.hover_position = None
@@ -541,3 +611,25 @@ class InteractiveTable(Widget):
                         await cell.begin_editing()
                         self.refresh()
                         self.is_in_edit_mode = True
+            case other:
+                if other.isalnum() and len(other) == 1:
+                    current_position = (
+                        self.selection_position
+                        if self.selection_position is not None
+                        else TablePosition("", 0)
+                    )
+                    next_row = self.model.get_next_row_matching(
+                        current_position.row, other
+                    )
+                    if next_row is not None:
+                        self.selection_position = TablePosition(
+                            current_position.column, next_row
+                        )
+
+    async def handle_cell_finished_editing(self, event: CellFinishedEditing):
+        self.is_in_edit_mode = False
+
+    async def handle_cell_edited(self, event: CellEdited):
+        self.model.on_cell_update(event.position, event.new_content)
+        self.refresh_data_from_model()
+        self.refresh()

@@ -7,6 +7,7 @@ from .interactive_table import (
     EditableIntTableCell,
     EditableChoiceTableCell,
     TableTheme,
+    CellFinishedEditing,
 )
 from .footer import Footer
 
@@ -20,4 +21,5 @@ __all__ = [
     EditableIntTableCell,
     EditableChoiceTableCell,
     TableTheme,
+    CellFinishedEditing,
 ]
