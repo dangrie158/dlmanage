@@ -8,32 +8,35 @@ from widgets.interactive_table import (
     TablePosition,
 )
 from slurmbridge import User, Account, AssociationBaseObject
-from rich.style import Style, NULL_STYLE
 
 
-def get_effective_gres(
+async def get_effective_gres(
     object: AssociationBaseObject, resource: str
 ) -> Tuple[AssociationBaseObject, str | None]:
-    while object is not None and getattr(object, resource) is None:
-        object = object.parent
+    value = None
+    while object is not None and value is None:
+        value = await getattr(object, resource)
+        object = await object.parent
 
-    return object, getattr(object, resource, None)
+    return object, value
 
 
 class UserListModel(InteractiveTableModel):
     title = "All Users"
 
     def __init__(self):
-        self._data = User.all()
-        self._available_accounts = Account.all()
         self._columns = {
             "user": {"ratio": 2, "no_wrap": True},
             "account": {"ratio": 2, "no_wrap": True},
-            "CPUs": {"justify": "right", "ratio": 2, "no_wrap": True},
-            "GPUs": {"justify": "right", "ratio": 2, "no_wrap": True},
+            "CPUs": {"justify": "center", "ratio": 2, "no_wrap": True},
+            "GPUs": {"justify": "center", "ratio": 2, "no_wrap": True},
             "Timelimit": {"justify": "right", "ratio": 3, "no_wrap": True},
             "Home Directory": {"justify": "right", "ratio": 2, "no_wrap": True},
         }
+
+    async def load_data(self):
+        self._data = await User.all()
+        self._available_accounts = await Account.all()
 
     def get_columns(self) -> Sequence[str]:
         return self._columns.keys()
@@ -44,7 +47,7 @@ class UserListModel(InteractiveTableModel):
     def get_column_kwargs(self, column_name: str) -> Mapping[str, Any]:
         return self._columns.get(column_name, {})
 
-    def get_cell(self, position: TablePosition) -> str:
+    async def get_cell(self, position: TablePosition) -> str | None:
         column, row = position
         row_data = self._data[row]
         cell_text: str | None = None
@@ -54,9 +57,9 @@ class UserListModel(InteractiveTableModel):
             case "account":
                 cell_text = row_data.default_account
             case "CPUs":
-                cell_text = row_data.max_cpus
+                cell_text = await row_data.max_cpus
             case "GPUs":
-                cell_text = row_data.max_gpus
+                cell_text = await row_data.max_gpus
             case "Timelimit":
                 cell_text = row_data.grp_wall
             case "Home Directory":
@@ -66,7 +69,7 @@ class UserListModel(InteractiveTableModel):
 
         return cell_text
 
-    def get_cell_class(
+    async def get_cell_class(
         self, position: TablePosition
     ) -> Tuple[Type[TableCell], Dict[str, Any]]:
         cell_placeholder = "<undefined>"
@@ -79,8 +82,8 @@ class UserListModel(InteractiveTableModel):
                     "choices": [account.account for account in self._available_accounts]
                 }
             case "CPUs":
-                if row_data.max_cpus is None:
-                    object, limit = get_effective_gres(row_data, "max_cpus")
+                if await row_data.max_cpus is None:
+                    object, limit = await get_effective_gres(row_data, "max_cpus")
                     if limit is not None:
                         cell_placeholder = f"{limit} <shared with all in {object!r}>"
                 return EditableIntTableCell, {
@@ -88,8 +91,8 @@ class UserListModel(InteractiveTableModel):
                     "placeholder": cell_placeholder,
                 }
             case "GPUs":
-                if row_data.max_gpus is None:
-                    object, limit = get_effective_gres(row_data, "max_gpus")
+                if await row_data.max_gpus is None:
+                    object, limit = await get_effective_gres(row_data, "max_gpus")
                     if limit is not None:
                         cell_placeholder = f"{limit} <shared with all in {object!r}>"
                 return EditableIntTableCell, {
@@ -103,28 +106,28 @@ class UserListModel(InteractiveTableModel):
             case unknown_name:
                 raise AttributeError(f"Unknown column: {unknown_name}")
 
-    def on_cell_update(self, position: TablePosition, new_value: str) -> None:
+    async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
         affected_object = self._data[position.row]
         match position.column:
             case "account":
-                new_account = Account.get(account=new_value)
-                affected_object.set_account(new_account)
+                new_account = await Account.get(account=new_value)
+                await affected_object.set_account(new_account)
             case "CPUs":
-                affected_object.max_cpus = new_value
-                affected_object.save()
+                affected_object.set_max_cpus(new_value)
+                await affected_object.save()
             case "GPUs":
-                affected_object.max_gpus = new_value
-                affected_object.save()
+                affected_object.set_max_gpus(new_value)
+                await affected_object.save()
             case "Timelimit":
                 affected_object.grp_wall = new_value
-                affected_object.save()
+                await affected_object.save()
             case unknown_name:
                 raise AttributeError(f"Can't update column {unknown_name}")
 
-    def on_row_delete(self, position: TablePosition) -> None:
+    async def on_row_delete(self, position: TablePosition) -> None:
         pass
 
-    def on_row_add(self, position: TablePosition) -> None:
+    async def on_row_add(self, position: TablePosition) -> None:
         pass
 
 
@@ -132,17 +135,19 @@ class AccountListModel(InteractiveTableModel):
     title = "All Accounts"
 
     def __init__(self):
-        self._data = Account.all()
         self._columns = {
             "account": {"ratio": 1, "no_wrap": True},
-            "CPUs for all Members": {"justify": "right", "ratio": 1, "no_wrap": True},
-            "GPUs for all Members": {"justify": "right", "ratio": 1, "no_wrap": True},
+            "CPUs for all Members": {"justify": "center", "ratio": 1, "no_wrap": True},
+            "GPUs for all Members": {"justify": "center", "ratio": 1, "no_wrap": True},
             "Timelimit for all Members": {
                 "justify": "right",
                 "ratio": 1,
                 "no_wrap": True,
             },
         }
+
+    async def load_data(self):
+        self._data = await Account.all()
 
     def get_columns(self) -> Sequence[str]:
         return self._columns.keys()
@@ -153,7 +158,7 @@ class AccountListModel(InteractiveTableModel):
     def get_column_kwargs(self, column_name: str) -> Mapping[str, Any]:
         return self._columns.get(column_name, {})
 
-    def get_cell(self, position: TablePosition) -> str:
+    async def get_cell(self, position: TablePosition) -> str | None:
         column, row = position
         row_data = self._data[row]
         cell_text: str | None = None
@@ -161,9 +166,9 @@ class AccountListModel(InteractiveTableModel):
             case "account":
                 cell_text = row_data.account
             case "CPUs for all Members":
-                cell_text = row_data.max_cpus
+                cell_text = await row_data.max_cpus
             case "GPUs for all Members":
-                cell_text = row_data.max_gpus
+                cell_text = await row_data.max_gpus
             case "Timelimit for all Members":
                 cell_text = row_data.grp_wall
             case unknown_name:
@@ -171,7 +176,7 @@ class AccountListModel(InteractiveTableModel):
 
         return cell_text
 
-    def get_cell_class(
+    async def get_cell_class(
         self, position: TablePosition
     ) -> Tuple[Type[TableCell], Dict[str, Any]]:
         cell_placeholder = "<undefined>"
@@ -180,8 +185,8 @@ class AccountListModel(InteractiveTableModel):
             case "account":
                 return TableCell, {}
             case "CPUs for all Members":
-                if row_data.max_cpus is None:
-                    object, limit = get_effective_gres(row_data, "max_cpus")
+                if await row_data.max_cpus is None:
+                    object, limit = await get_effective_gres(row_data, "max_cpus")
                     if limit is not None:
                         cell_placeholder = f"{limit} <inherited from {object!r}>"
                 return EditableIntTableCell, {
@@ -189,8 +194,8 @@ class AccountListModel(InteractiveTableModel):
                     "placeholder": cell_placeholder,
                 }
             case "GPUs for all Members":
-                if row_data.max_gpus is None:
-                    object, limit = get_effective_gres(row_data, "max_gpus")
+                if await row_data.max_gpus is None:
+                    object, limit = await get_effective_gres(row_data, "max_gpus")
                     if limit is not None:
                         cell_placeholder = f"{limit} <inherited from {object!r}>"
                 return EditableIntTableCell, {
@@ -202,13 +207,13 @@ class AccountListModel(InteractiveTableModel):
             case unknown_name:
                 raise AttributeError(f"Unknown column: {unknown_name}")
 
-    def on_cell_update(self, position: TablePosition, new_value: str) -> None:
+    async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
         pass
 
-    def on_row_delete(self, position: TablePosition) -> None:
+    async def on_row_delete(self, position: TablePosition) -> None:
         pass
 
-    def on_row_add(self, position: TablePosition) -> None:
+    async def on_row_add(self, position: TablePosition) -> None:
         pass
 
 

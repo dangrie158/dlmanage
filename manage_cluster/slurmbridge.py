@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import dataclasses
-from datetime import datetime
 from functools import cached_property
 from glob import glob
-import os
 import re
-import subprocess
+import asyncio
 import shutil
 from typing import (
     Any,
@@ -20,6 +18,8 @@ from typing import (
     Type,
     TypeVar,
 )
+
+from async_property import async_property
 
 SACCTMGR_PATH = shutil.which("sacctmgr")
 
@@ -146,7 +146,7 @@ class SlurmObject(Generic[ObjectType]):
         ]
 
     @classmethod
-    def _run_scattmgr_command(
+    async def _run_scattmgr_command(
         cls,
         verb: str,
         *arguments: str,
@@ -155,21 +155,18 @@ class SlurmObject(Generic[ObjectType]):
         if SACCTMGR_PATH is None:
             raise ImportError("sacctmgr could not be found in path.")
 
-        process = subprocess.run(
-            args=[
-                SACCTMGR_PATH,
-                verb,
-                *arguments,
-                "--parsable2",  # seperate values by a PIPE
-                "--noheader",
-            ],
-            capture_output=True,
-            timeout=5,
+        process = await asyncio.create_subprocess_exec(
+            SACCTMGR_PATH,
+            verb,
+            *arguments,
+            "--parsable2",  # seperate values by a PIPE
+            "--noheader",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        stdout, stderr = await process.communicate()
 
-        process_output = (
-            process.stderr if len(process.stderr) > 0 else process.stdout
-        ).decode("ascii")
+        process_output = (stderr if len(stderr) > 0 else stdout).decode("ascii")
 
         if not error_ok and process.returncode != 0:
             raise SlurmAccountManagerError(process_output)
@@ -177,7 +174,7 @@ class SlurmObject(Generic[ObjectType]):
         return process_output
 
     @classmethod
-    def _scattmgr_show(
+    async def _scattmgr_show(
         cls,
         fields: Sequence[str],
         filters: Optional[Mapping[str, str]] = None,
@@ -190,7 +187,7 @@ class SlurmObject(Generic[ObjectType]):
             for column, value in filters.items():
                 filter_args.append(f"{column}={value}")
 
-        process_output = cls._run_scattmgr_command(
+        process_output = await cls._run_scattmgr_command(
             "show", cls.__name__, *cls.query_options, format_string, *filter_args
         )
 
@@ -199,7 +196,7 @@ class SlurmObject(Generic[ObjectType]):
         ]
 
     @classmethod
-    def _scattmgr_write(
+    async def _scattmgr_write(
         cls,
         verb: str,
         new_values: Mapping[str, str],
@@ -218,7 +215,7 @@ class SlurmObject(Generic[ObjectType]):
             for field_name, new_value in new_values.items():
                 update_args.append(f"{field_name}={new_value}")
 
-        process_output = cls._run_scattmgr_command(
+        process_output = await cls._run_scattmgr_command(
             verb, cls.__name__, *filter_args, *update_args, "--immediate", error_ok=True
         )
 
@@ -276,23 +273,23 @@ class SlurmObject(Generic[ObjectType]):
         return update_fields, filter_fields
 
     @classmethod
-    def filter(cls, **filters: str) -> Sequence[ObjectType]:
+    async def filter(cls, **filters: str) -> Sequence[ObjectType]:
         Object_fields = [
             snake_to_camel_case(field.name) for field in dataclasses.fields(cls)
         ]
-        object_data = cls._scattmgr_show(
+        object_data = await cls._scattmgr_show(
             Object_fields,
             filters,
         )
         return cls._response_to_instances(object_data)
 
     @classmethod
-    def all(cls) -> Sequence[ObjectType]:
-        return cls.filter()
+    async def all(cls) -> Sequence[ObjectType]:
+        return await cls.filter()
 
     @classmethod
-    def get(cls, **filters: str) -> ObjectType:
-        user_list = cls.filter(**filters)
+    async def get(cls, **filters: str) -> ObjectType:
+        user_list = await cls.filter(**filters)
         if len(user_list) == 0:
             raise NotFound(cls)
         if len(user_list) > 1:
@@ -300,44 +297,44 @@ class SlurmObject(Generic[ObjectType]):
         return user_list[0]
 
     @classmethod
-    def create(cls: Type[ObjectType], **attrs) -> ObjectType:
+    async def create(cls: Type[ObjectType], **attrs) -> ObjectType:
         new_object = cls(**attrs)
-        created = new_object.save()
+        created = await new_object.save()
         if not created:
             raise AssertionError(
                 f"Failed to create new {cls.__name__}. Maybe the object already existed?"
             )
         return new_object
 
-    def save(self) -> bool:
+    async def save(self) -> bool:
         created = False
         updates, filters = self._to_query()
 
-        updated_keys = self._scattmgr_write("modify", updates, filters)
+        updated_keys = await self._scattmgr_write("modify", updates, filters)
         if len(updated_keys) == 0:
             # the object was not yet present in the db, create a new one
-            self._scattmgr_write("create", updates | filters, {})
+            await self._scattmgr_write("create", updates | filters, {})
             created = True
         elif len(updated_keys) > 1:
             raise AssertionError(
                 f"Modified more than a single Object!. Modified keys: {updated_keys}"
             )
 
-        self.refresh_from_db()
+        await self.refresh_from_db()
 
         return created
 
-    def refresh_from_db(self):
+    async def refresh_from_db(self):
         _, filters = self._to_query()
-        new_object = self.get(**filters)
+        new_object = await self.get(**filters)
         for field in dataclasses.fields(new_object):
             del self.__dict__[field.name]
             setattr(self, field.name, getattr(new_object, field.name))
 
-    def delete(self) -> bool:
+    async def delete(self) -> bool:
         _, filters = self._to_query()
 
-        updated_keys = self._scattmgr_write("delete", {}, filters)
+        updated_keys = await self._scattmgr_write("delete", {}, filters)
         if len(updated_keys) > 1:
             raise AssertionError(
                 f"Deleted more than a single Object!. Deleted keys: {updated_keys}"
@@ -372,30 +369,28 @@ class AssociationBaseObject(SlurmObject[ObjectType]):
     max_submit_jobs: Optional[str] = dataclasses.field(repr=False, default=None)
     qos: Optional[str] = dataclasses.field(repr=False, default=None)
 
-    @property
-    def parent(self) -> Association | None:
+    @async_property
+    async def parent(self) -> Association | None:
         if self.parent_id:
-            return Association.get(id=self.parent_id)
+            return await Association.get(id=self.parent_id)
         return None
 
-    @property
-    def association(self) -> Association:
+    @async_property
+    async def association(self) -> Association:
         raise NotImplemented
 
-    @property
-    def max_gpus(self):
-        return get_gres_value(self.association.grp_tres, "gres/gpu")
+    @async_property
+    async def max_gpus(self):
+        return get_gres_value((await self.association).grp_tres, "gres/gpu")
 
-    @max_gpus.setter
-    def max_gpus(self, new_val):
+    def set_max_gpus(self, new_val):
         self.grp_tres = update_gres_value(self.grp_tres, "gres/gpu", new_val)
 
-    @property
-    def max_cpus(self):
-        return get_gres_value(self.association.grp_tres, "cpu")
+    @async_property
+    async def max_cpus(self):
+        return get_gres_value((await self.association).grp_tres, "cpu")
 
-    @max_cpus.setter
-    def max_cpus(self, new_val):
+    def set_max_cpus(self, new_val):
         self.grp_tres = update_gres_value(self.grp_tres, "cpu", new_val)
 
 
@@ -406,14 +401,14 @@ class User(AssociationBaseObject["User"], SlurmObject["User"]):
     user: PrimaryStringField
     default_account: str
 
-    @property
-    def account(self) -> Account | None:
+    @async_property
+    async def account(self) -> Account | None:
         try:
-            return Account.get(account=self.default_account)
+            return await Account.get(account=self.default_account)
         except NotFound:
             return None
 
-    def set_account(self, new_account: Account):
+    async def set_account(self, new_account: Account):
         old_account = self.account
 
         # create a new user to generate the association with User + Account
@@ -421,19 +416,19 @@ class User(AssociationBaseObject["User"], SlurmObject["User"]):
         del new_user.default_account
         new_user.default_account = new_account.account
         updates, filters = new_user._to_query()
-        self._scattmgr_write("create", updates | filters, {})
+        await self._scattmgr_write("create", updates | filters, {})
 
         # delete the old association (this is done by removing the user with an additional account filter)
         if old_account is not None:
             _, filters = self._to_query()
             filters["account"] = old_account.account
-            self._scattmgr_write("delete", {}, filters)
+            await self._scattmgr_write("delete", {}, filters)
 
-        self.refresh_from_db()
+        await self.refresh_from_db()
 
-    @property
-    def association(self) -> Association:
-        return Association.get(user=self.user, account=self.default_account)
+    @async_property
+    async def association(self) -> Association:
+        return await Association.get(user=self.user, account=self.default_account)
 
     @cached_property
     def home_directory(self) -> str | None:
@@ -444,9 +439,9 @@ class User(AssociationBaseObject["User"], SlurmObject["User"]):
 class Account(AssociationBaseObject["Account"], SlurmObject["Account"]):
     account: PrimaryStringField
 
-    @property
-    def association(self) -> Association:
-        return Association.get(user="", account=self.account)
+    @async_property
+    async def association(self) -> Association:
+        return await Association.get(user="", account=self.account)
 
 
 @dataclasses.dataclass
@@ -456,8 +451,8 @@ class Association(AssociationBaseObject["Association"], SlurmObject["Association
     user: PrimaryStringField
     partition: str
 
-    @property
-    def association(self) -> Association:
+    @async_property
+    async def association(self) -> Association:
         return self
 
     def __repr__(self):

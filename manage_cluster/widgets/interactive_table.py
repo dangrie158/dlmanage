@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
+import threading
 from typing import (
     Any,
     Dict,
@@ -10,7 +11,6 @@ from typing import (
     Sequence,
     Tuple,
     Type,
-    Union,
 )
 from abc import ABC, abstractmethod
 
@@ -18,6 +18,7 @@ import rich
 from rich.style import Style, NULL_STYLE
 from rich.table import Table
 from rich.text import Text
+from rich.panel import Panel
 from rich.padding import PaddingDimensions
 from rich.console import RenderableType
 
@@ -260,7 +261,7 @@ class EditableChoiceTableCell(EditableTableCell):
         placeholder: str = "<undefined>",
         choices: Optional[Sequence[str]] = None,
     ):
-        self.choices = choices or [text]
+        self.choices = choices or ([text] if text else [])
 
         theme = theme or TableTheme()
         style = style or theme.choice_cell
@@ -356,6 +357,10 @@ class InteractiveTableModel(ABC):
     title: str
 
     @abstractmethod
+    async def load_data(self):
+        ...
+
+    @abstractmethod
     def get_columns(self) -> Sequence[str]:
         ...
 
@@ -364,51 +369,51 @@ class InteractiveTableModel(ABC):
         ...
 
     @abstractmethod
-    def on_cell_update(self, position: TablePosition, new_value: str) -> None:
+    async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
         ...
 
     @abstractmethod
-    def on_row_delete(self, position: TablePosition) -> None:
+    async def on_row_delete(self, position: TablePosition) -> None:
         ...
 
     @abstractmethod
-    def on_row_add(self, position: TablePosition) -> None:
+    async def on_row_add(self, position: TablePosition) -> None:
         ...
 
     def get_column_kwargs(self, column_name: str) -> Mapping[str, Any]:
         return {}
 
-    def get_cell_class(
+    async def get_cell_class(
         self, position: TablePosition
     ) -> Tuple[Type[TableCell], Dict[str, Any]]:
         return TableCell, {}
 
     @abstractmethod
-    def get_cell(self, position: TablePosition) -> str:
+    async def get_cell(self, position: TablePosition) -> str:
         ...
 
     def get_primary_column(self) -> str:
         return list(self.get_columns())[0]
 
-    def is_cell_editable(self, position: TablePosition) -> bool:
+    async def is_cell_editable(self, position: TablePosition) -> bool:
         try:
-            cell_class, _ = self.get_cell_class(position)
+            cell_class, _ = await self.get_cell_class(position)
         except:
             return False
         return issubclass(cell_class, EditableTableCell)
 
-    def get_editable_columns(self, row: int) -> Sequence[str]:
+    async def get_editable_columns(self, row: int) -> Sequence[str]:
         return [
             column_name
             for column_name in self.get_columns()
-            if self.is_cell_editable(TablePosition(column_name, row))
+            if await self.is_cell_editable(TablePosition(column_name, row))
         ]
 
-    def get_next_colum(self, position: Optional[TablePosition]) -> str | None:
+    async def get_next_colum(self, position: Optional[TablePosition]) -> str | None:
         row = position.row if position is not None else 0
-        columns = self.get_editable_columns(row)
+        columns = await self.get_editable_columns(row)
 
-        if position is None or not self.is_cell_editable(position):
+        if position is None or not await self.is_cell_editable(position):
             return columns[0] if len(columns) > 0 else None
 
         try:
@@ -419,11 +424,11 @@ class InteractiveTableModel(ABC):
             pass
         return None
 
-    def get_previous_colum(self, position: Optional[TablePosition]) -> str | None:
+    async def get_previous_colum(self, position: Optional[TablePosition]) -> str | None:
         row = position.row if position is not None else 0
-        columns = self.get_editable_columns(row)
+        columns = await self.get_editable_columns(row)
 
-        if position is None or not self.is_cell_editable(position):
+        if position is None or not await self.is_cell_editable(position):
             return columns[-1] if len(columns) > 0 else None
         try:
             current_index = columns.index(position.column)
@@ -433,14 +438,14 @@ class InteractiveTableModel(ABC):
             pass
         return None
 
-    def get_next_row_matching(self, current_row: int, needle: str) -> int | None:
+    async def get_next_row_matching(self, current_row: int, needle: str) -> int | None:
         search_column = self.get_primary_column()
 
         total_rows = self.get_num_rows()
         candidates = list(range(current_row + 1, total_rows))
         candidates += list(range(0, current_row))
         for row in candidates:
-            value = self.get_cell(TablePosition(search_column, row))
+            value = await self.get_cell(TablePosition(search_column, row))
             if value.startswith(needle):
                 return row
         return None
@@ -450,10 +455,12 @@ class InteractiveTable(Widget):
     selection_position: Reactive[Optional[TablePosition]] = Reactive(None, layout=True)
     hover_position: Reactive[Optional[TablePosition]] = Reactive(None, layout=True)
     is_in_edit_mode: Reactive[bool] = Reactive(False)
+    model: Reactive[Optional[InteractiveTableModel]] = Reactive(None, layout=True)
+
+    _refresh_data_lock: threading.Lock = threading.Lock()
 
     def __init__(
         self,
-        model: InteractiveTableModel,
         *,
         name: str | None = None,
         padding: PaddingDimensions = (1, 1),
@@ -464,34 +471,33 @@ class InteractiveTable(Widget):
         self.cells: Dict[TablePosition, TableCell] = {}
         self.columns: Sequence[str] = []
         self.num_rows: int = 0
-        self.model = model
-        self.refresh_data_from_model()
 
         super().__init__(name=name)
         self.padding = padding
 
-    async def set_model(self, new_model: InteractiveTableModel):
-        self.model = new_model
-        self.refresh_data_from_model()
-        self.refresh()
+    async def watch_model(self, new_model: InteractiveTableModel):
+        await self.refresh_data_from_model()
 
-    def refresh_data_from_model(self):
-        # TODO: handle removing of old data
-        #       and updating only cell content instead of the complete object
-        self.num_rows = self.model.get_num_rows()
-        self.columns = self.model.get_columns()
-        for column in self.model.get_columns():
-            for row in range(self.num_rows):
-                current_position = TablePosition(column, row)
-                cell_text = self.model.get_cell(current_position)
-                cell_class, cell_kwargs = self.model.get_cell_class(current_position)
-                cell = cell_class(
-                    current_position, cell_text, theme=self.theme, **cell_kwargs
-                )
-                for attr_name, attr_value in cell_kwargs.items():
-                    setattr(cell, attr_name, attr_value)
-                cell.set_parent(self)
-                self.cells[current_position] = cell
+    async def refresh_data_from_model(self):
+        with self._refresh_data_lock:
+            # TODO: handle removing of old data
+            #       and updating only cell content instead of the complete object
+            self.num_rows = self.model.get_num_rows()
+            self.columns = self.model.get_columns()
+            for column in self.columns:
+                for row in range(self.num_rows):
+                    current_position = TablePosition(column, row)
+                    cell_text = await self.model.get_cell(current_position)
+                    cell_class, cell_kwargs = await self.model.get_cell_class(
+                        current_position
+                    )
+                    cell = cell_class(
+                        current_position, cell_text, theme=self.theme, **cell_kwargs
+                    )
+                    for attr_name, attr_value in cell_kwargs.items():
+                        setattr(cell, attr_name, attr_value)
+                    cell.set_parent(self)
+                    self.cells[current_position] = cell
 
     def watch_selection_position(
         self, old_value: Optional[TablePosition], new_value: Optional[TablePosition]
@@ -511,27 +517,32 @@ class InteractiveTable(Widget):
         if new_value is not None and new_value in self.cells:
             self.cells[new_value].hover_enter()
 
-    def render(self) -> Table:
+    def render(self) -> RenderableType:
+        if self.model is None or self._refresh_data_lock.locked():
+            return Panel(Text("Loading"), title="loading")
+
         table = Table(expand=True, highlight=True)
-        for column in self.columns:
-            column_kwargs = self.model.get_column_kwargs(column)
-            table.add_column(column, **column_kwargs)
 
-        for row in range(self.num_rows):
-            row_style: Style = None
-            if self.selection_position and self.selection_position.row == row:
-                row_style = self.theme.selected_row
-            elif self.is_in_edit_mode:
-                row_style = self.theme.disabled_row
-            else:
-                row_style = NULL_STYLE
-
-            cells = []
+        with self._refresh_data_lock:
             for column in self.columns:
-                current_position = TablePosition(column, row)
-                cell = self.cells[current_position]
-                cells.append(cell.render())
-            table.add_row(*cells, style=row_style)
+                column_kwargs = self.model.get_column_kwargs(column)
+                table.add_column(column, **column_kwargs)
+
+            for row in range(self.num_rows):
+                row_style: Style
+                if self.selection_position and self.selection_position.row == row:
+                    row_style = self.theme.selected_row
+                elif self.is_in_edit_mode:
+                    row_style = self.theme.disabled_row
+                else:
+                    row_style = NULL_STYLE
+
+                cells = []
+                for column in self.columns:
+                    current_position = TablePosition(column, row)
+                    cell = self.cells[current_position]
+                    cells.append(cell.render())
+                table.add_row(*cells, style=row_style)
         return table
 
     async def on_click(self, event: events.Click) -> None:
@@ -587,7 +598,9 @@ class InteractiveTable(Widget):
                 if self.selection_position is None:
                     return
 
-                previous_column = self.model.get_previous_colum(self.selection_position)
+                previous_column = await self.model.get_previous_colum(
+                    self.selection_position
+                )
                 if previous_column is not None:
                     self.selection_position = TablePosition(
                         previous_column, self.selection_position.row
@@ -596,7 +609,7 @@ class InteractiveTable(Widget):
                 if self.selection_position is None:
                     return
 
-                next_column = self.model.get_next_colum(self.selection_position)
+                next_column = await self.model.get_next_colum(self.selection_position)
                 if next_column is not None:
                     self.selection_position = TablePosition(
                         next_column, self.selection_position.row
@@ -618,7 +631,7 @@ class InteractiveTable(Widget):
                         if self.selection_position is not None
                         else TablePosition("", 0)
                     )
-                    next_row = self.model.get_next_row_matching(
+                    next_row = await self.model.get_next_row_matching(
                         current_position.row, other
                     )
                     if next_row is not None:
@@ -630,6 +643,8 @@ class InteractiveTable(Widget):
         self.is_in_edit_mode = False
 
     async def handle_cell_edited(self, event: CellEdited):
-        self.model.on_cell_update(event.position, event.new_content)
-        self.refresh_data_from_model()
+        await self.model.on_cell_update(event.position, event.new_content)
+        # TODO: place this somewhere nice
+        await self.model.load_data()
+        await self.refresh_data_from_model()
         self.refresh()

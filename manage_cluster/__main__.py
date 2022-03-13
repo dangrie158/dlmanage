@@ -40,12 +40,12 @@ class SlurmControl(App):
         header.disable_messages(events.Click)
         footer = Footer(style=self.theme.header)
 
-        self.main_content = user_list = InteractiveTable(
-            model=UserListModel(), name="UserList", theme=self.theme
+        self.main_content = object_list = InteractiveTable(
+            name="ObjectList", theme=self.theme
         )
         self.main_content.can_focus = True
         self.main_content.border = "round"
-        self.main_content_container = ScrollView(user_list)
+        self.main_content_container = ScrollView(object_list)
 
         self.sidebar_content = model_tree = TreeControl("Models", None)
         self.sidebar_content.border = "round"
@@ -79,14 +79,12 @@ class SlurmControl(App):
             await self.sidebar_content.focus()
 
     async def handle_tree_click(self, message: TreeClick) -> None:
-        model = message.node.data
-        if model is not None and issubclass(model, InteractiveTableModel):
-            await self.main_content.set_model(model())
+        model_class = message.node.data
+        if model_class is not None and issubclass(model_class, InteractiveTableModel):
+            model = model_class()
+            await model.load_data()
+            self.main_content.model = model
 
 
 if __name__ == "__main__":
-
-    # from manage_cluster.slurmbridge import Account, User
-    # x = User.get(user="test")
-    # x.parent
-    SlurmControl.run(title="Slurm Control", log="slurm_control.log")
+    SlurmControl.run(title="Slurm Control")
