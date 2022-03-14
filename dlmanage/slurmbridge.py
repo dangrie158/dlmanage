@@ -1,25 +1,30 @@
 from __future__ import annotations
 
 import dataclasses
+from email.policy import default
 from functools import cached_property
+from abc import ABC
 from glob import glob
 import re
 import asyncio
 import shutil
+from copy import copy
+from types import new_class
 from typing import (
     Any,
     ClassVar,
     Dict,
     Generic,
+    List,
     Mapping,
     Optional,
     Sequence,
     Tuple,
     Type,
     TypeVar,
+    Union,
 )
 
-from async_property import async_property
 
 SACCTMGR_PATH = shutil.which("sacctmgr")
 
@@ -51,6 +56,9 @@ def get_gres_value(haystack: str, needle: str) -> Optional[str]:
 def update_gres_value(haystack: str, needle: str, new_value: str) -> str:
     if haystack is None:
         haystack = ""
+
+    if new_value == None:
+        new_value = "-1"
 
     new_haystack_parts: list[str] = []
     parts = haystack.split(",")
@@ -86,14 +94,15 @@ def find_home_directory(username: str) -> str | None:
 
 
 class SlurmAccountManagerError(Exception):
-    pass
+    def __str__(self) -> str:
+        return f"{self.args[0]}"
 
 
 class SlurmObjectException(Exception):
     def __init__(self, Object_class):
         self.Object_class = Object_class
 
-    def __repr__(self) -> str:
+    def __str__(self) -> str:
         return f"{self.Object_class.__name__} - {self.__class__.__name__}"
 
 
@@ -105,45 +114,69 @@ class MultipleObjectReturned(SlurmObjectException):
     pass
 
 
-class ReadOnlyStringField(str):
-    pass
+FieldType = TypeVar("FieldType")
 
 
-class PrimaryStringField(ReadOnlyStringField):
-    pass
+class ReadOnlyField(Generic[FieldType]):
+    """This field will be ignored when writing the object to sacctmgr"""
+
+
+class SyntheticField(ReadOnlyField[FieldType]):
+    """
+    This field will be ignored when querying sacctmgr and when writing back objects.
+    It is synthesized, probably based on other attributes of the object during
+    object instantiation
+    """
+
+
+class PrimaryKeyField(ReadOnlyField[FieldType]):
+    """
+    this field is used to identify the object when building a query to sacctmgr
+    """
+
+
+class WriteOnlyField(Generic[FieldType]):
+    """
+    some fields in sacctmgr are write only, e.g. NewUsername
+    """
 
 
 ObjectType = TypeVar("ObjectType", bound="SlurmObject")
+WritableObjectType = TypeVar("WritableObjectType", bound="WritableSlurmObject")
 
 
-@dataclasses.dataclass
-class SlurmObject(Generic[ObjectType]):
+class SlurmObject(ABC, Generic[ObjectType]):
     query_options: ClassVar[Sequence[str]] = tuple()
+    _primary_key_fields: List[str]
+    _read_only_fields: List[str]
+    _write_only_fields: List[str]
+    _synthetic_fields: List[str]
+
+    def __init_subclass__(cls) -> None:
+        super().__init_subclass__()
+        cls = dataclasses.dataclass(cls)
+        cls._primary_key_fields = cls._collect_all_fields_of_type(PrimaryKeyField)
+        cls._read_only_fields = cls._collect_all_fields_of_type(ReadOnlyField)
+        cls._write_only_fields = cls._collect_all_fields_of_type(WriteOnlyField)
+        cls._synthetic_fields = cls._collect_all_fields_of_type(SyntheticField)
+
+    @classmethod
+    def _collect_all_fields_of_type(cls, field_type: Type):
+        field_types = [field_type, *field_type.__subclasses__()]
+        field_type_names = [cls.__name__ for cls in field_types]
+        return [
+            field.name
+            for field in dataclasses.fields(cls)
+            if any(
+                field_type_name in field.type for field_type_name in field_type_names
+            )
+        ]
 
     def __setattr__(self, __name: str, __value: Any) -> None:
+        # make writing to read-only fields a runtime error
         if hasattr(self, __name) and __name in self._read_only_fields:
             raise AttributeError(f"{__name} is a read-only field")
         return super().__setattr__(__name, __value)
-
-    @cached_property
-    def _primary_key_fields(self) -> Sequence[str]:
-        pk_field_types = [PrimaryStringField, *PrimaryStringField.__subclasses__()]
-        pk_field_type_names = [cls.__name__ for cls in pk_field_types]
-        return [
-            field.name
-            for field in dataclasses.fields(self)
-            if field.type in pk_field_type_names
-        ]
-
-    @cached_property
-    def _read_only_fields(self) -> Sequence[str]:
-        ro_field_types = [ReadOnlyStringField, *ReadOnlyStringField.__subclasses__()]
-        ro_field_type_names = [cls.__name__ for cls in ro_field_types]
-        return [
-            field.name
-            for field in dataclasses.fields(self)
-            if field.type in ro_field_type_names
-        ]
 
     @classmethod
     async def _run_scattmgr_command(
@@ -196,6 +229,83 @@ class SlurmObject(Generic[ObjectType]):
         ]
 
     @classmethod
+    def _response_to_attributes(
+        cls: Type[ObjectType], response_data: Dict[str, str]
+    ) -> Dict[str, str | None]:
+        empty_variants = ("0-00:00:00", "", "0", "00:00:00")
+        return {
+            # some values will always return a value although they are empty
+            # we need to ignore them here to make sure not to set these values
+            # when saving the object again
+            camel_to_snake_case(key): value if value not in empty_variants else None
+            for key, value in response_data.items()
+        }
+
+    @classmethod
+    def _response_to_instances(
+        cls: Type[ObjectType], response: Sequence[Dict[str, str]]
+    ) -> Sequence[ObjectType]:
+        instances: list[ObjectType] = []
+        for data in response:
+            attributes = cls._response_to_attributes(data)
+            instance = cls(**attributes)
+            instances.append(instance)
+        return instances
+
+    def _to_query(self) -> Tuple[Dict[str, str], Dict[str, str]]:
+        update_fields: Dict[str, str] = {}
+        filter_fields: Dict[str, str] = {}
+
+        for field in dataclasses.fields(self):
+            value = getattr(self, field.name)
+            if field.name in self._primary_key_fields:
+                filter_fields[snake_to_camel_case(field.name)] = value
+            elif (
+                field.name not in (self._read_only_fields + self._synthetic_fields)
+                and value
+            ):
+                update_fields[snake_to_camel_case(field.name)] = value
+
+        return update_fields, filter_fields
+
+    @classmethod
+    async def filter(cls, **filters: str) -> Sequence[ObjectType]:
+        object_fields = [
+            snake_to_camel_case(field.name)
+            for field in dataclasses.fields(cls)
+            if field.name not in (cls._synthetic_fields + cls._write_only_fields)
+        ]
+        object_data = await cls._scattmgr_show(
+            object_fields,
+            filters,
+        )
+        instances = cls._response_to_instances(object_data)
+        # only return the queried type of instance
+        return [instance for instance in instances if isinstance(instance, cls)]
+
+    @classmethod
+    async def all(cls) -> Sequence[ObjectType]:
+        return await cls.filter()
+
+    @classmethod
+    async def get(cls, **filters: str) -> ObjectType:
+        user_list = await cls.filter(**filters)
+        if len(user_list) == 0:
+            raise NotFound(cls)
+        if len(user_list) > 1:
+            raise MultipleObjectReturned(cls)
+        return user_list[0]
+
+    async def refresh_from_db(self):
+        _, filters = self._to_query()
+        new_object = await self.get(**filters)
+        for field in dataclasses.fields(new_object):
+            del self.__dict__[field.name]
+            setattr(self, field.name, getattr(new_object, field.name))
+
+
+class WritableSlurmObject(SlurmObject[WritableObjectType]):
+    @classmethod
     async def _scattmgr_write(
         cls,
         verb: str,
@@ -243,61 +353,7 @@ class SlurmObject(Generic[ObjectType]):
         return modified_objects
 
     @classmethod
-    def _response_to_instances(
-        cls: Type[ObjectType], response: Sequence[Dict[str, str]]
-    ) -> Sequence[ObjectType]:
-        instances: list[ObjectType] = []
-        empty_variants = ("0-00:00:00", "", "0", "00:00:00")
-        for data in response:
-            attrs = {
-                # some values will always return a value although they are empty
-                # we need to ignore them here to make sure not to set these values
-                # when saving the object again
-                camel_to_snake_case(key): value if value not in empty_variants else None
-                for key, value in data.items()
-            }
-            instance = cls(**attrs)
-            instances.append(instance)
-        return instances
-
-    def _to_query(self) -> Tuple[Dict[str, str], Dict[str, str]]:
-        update_fields: Dict[str, str] = {}
-        filter_fields: Dict[str, str] = {}
-
-        for field, value in dataclasses.asdict(self).items():
-            if field in self._primary_key_fields:
-                filter_fields[snake_to_camel_case(field)] = value
-            elif field not in self._read_only_fields and value:
-                update_fields[snake_to_camel_case(field)] = value
-
-        return update_fields, filter_fields
-
-    @classmethod
-    async def filter(cls, **filters: str) -> Sequence[ObjectType]:
-        Object_fields = [
-            snake_to_camel_case(field.name) for field in dataclasses.fields(cls)
-        ]
-        object_data = await cls._scattmgr_show(
-            Object_fields,
-            filters,
-        )
-        return cls._response_to_instances(object_data)
-
-    @classmethod
-    async def all(cls) -> Sequence[ObjectType]:
-        return await cls.filter()
-
-    @classmethod
-    async def get(cls, **filters: str) -> ObjectType:
-        user_list = await cls.filter(**filters)
-        if len(user_list) == 0:
-            raise NotFound(cls)
-        if len(user_list) > 1:
-            raise MultipleObjectReturned(cls)
-        return user_list[0]
-
-    @classmethod
-    async def create(cls: Type[ObjectType], **attrs) -> ObjectType:
+    async def create(cls: Type[WritableObjectType], **attrs) -> WritableObjectType:
         new_object = cls(**attrs)
         created = await new_object.save()
         if not created:
@@ -324,13 +380,6 @@ class SlurmObject(Generic[ObjectType]):
 
         return created
 
-    async def refresh_from_db(self):
-        _, filters = self._to_query()
-        new_object = await self.get(**filters)
-        for field in dataclasses.fields(new_object):
-            del self.__dict__[field.name]
-            setattr(self, field.name, getattr(new_object, field.name))
-
     async def delete(self) -> bool:
         _, filters = self._to_query()
 
@@ -342,16 +391,24 @@ class SlurmObject(Generic[ObjectType]):
 
         return len(updated_keys) == 1
 
-    def copy(self) -> ObjectType:
-        attributes = dataclasses.asdict(self)
-        return self.__class__(**attributes)
 
+class Association(SlurmObject[ObjectType]):
+    query_options = ("tree",)
 
-@dataclasses.dataclass
-class AssociationBaseObject(SlurmObject[ObjectType]):
+    id: ReadOnlyField[str] = dataclasses.field()
+    parent_id: ReadOnlyField[str] = dataclasses.field(repr=False)
+    parent_name: ReadOnlyField[str] = dataclasses.field(repr=False)
+    parent: SyntheticField[Association | None]
+    nesting_level: SyntheticField[int]
+    cluster: ReadOnlyField[str]
+    account: ReadOnlyField[str]
+    user: ReadOnlyField[str | None]
+    partition: str
+    children: SyntheticField[Sequence[Association]] = dataclasses.field(
+        default_factory=lambda: list()
+    )
+
     _: dataclasses.KW_ONLY
-    parent_id: ReadOnlyStringField = dataclasses.field(repr=False)
-    parent_name: ReadOnlyStringField = dataclasses.field(repr=False)
     grp_tres_mins: Optional[str] = dataclasses.field(repr=False, default=None)
     grp_tres_run_mins: Optional[str] = dataclasses.field(repr=False, default=None)
     grp_tres: Optional[str] = dataclasses.field(repr=False, default=None)
@@ -369,50 +426,85 @@ class AssociationBaseObject(SlurmObject[ObjectType]):
     max_submit_jobs: Optional[str] = dataclasses.field(repr=False, default=None)
     qos: Optional[str] = dataclasses.field(repr=False, default=None)
 
-    @async_property
-    async def parent(self) -> Association | None:
-        if self.parent_id:
-            return await Association.get(id=self.parent_id)
-        return None
+    @classmethod
+    def _response_to_instances(
+        cls: Type[ObjectType], response: Sequence[Dict[str, str]]
+    ) -> Sequence[Union[User, Account]]:
+        instances: list[ObjectType] = []
+        # thanks to the "tree" query option we get the results in order and the
+        # account names are prefixed with spaces to represent the nesting level
+        # so we can rebuild the hierarchy tree keeping track of the information
+        hierarchy_stack: Dict[int, Association] = {}
+        for data in response:
+            attributes = cls._response_to_attributes(data)
+            account_response = attributes.pop("account") or ""
+            nesting_level = account_response.count(" ")
 
-    @async_property
-    async def association(self) -> Association:
-        raise NotImplemented
+            # find the parent of the instance
+            parent: Association | None = None
+            if nesting_level > 0:
+                parent = hierarchy_stack[nesting_level - 1]
 
-    @async_property
-    async def max_gpus(self):
-        return get_gres_value((await self.association).grp_tres, "gres/gpu")
+            # create the instance based on whether a username is given or not
+            instance_type = Account if attributes["user"] is None else User
+            account = account_response.strip()
+            instance = instance_type(
+                parent=parent,
+                account=account,
+                nesting_level=nesting_level,
+                **attributes,
+            )
 
-    def set_max_gpus(self, new_val):
+            # build the tree
+            if parent is not None:
+                parent.children.append(instance)
+            hierarchy_stack[nesting_level] = instance
+            instances.append(instance)
+        return instances
+
+    @property
+    def max_gpus(self):
+        return get_gres_value(self.grp_tres, "gres/gpu")
+
+    @max_gpus.setter
+    def max_gpus(self, new_val):
         self.grp_tres = update_gres_value(self.grp_tres, "gres/gpu", new_val)
 
-    @async_property
-    async def max_cpus(self):
-        return get_gres_value((await self.association).grp_tres, "cpu")
+    @property
+    def max_cpus(self):
+        return get_gres_value(self.grp_tres, "cpu")
 
-    def set_max_cpus(self, new_val):
+    @max_cpus.setter
+    def max_cpus(self, new_val):
         self.grp_tres = update_gres_value(self.grp_tres, "cpu", new_val)
 
 
-@dataclasses.dataclass
-class User(AssociationBaseObject["User"], SlurmObject["User"]):
-    query_options: ClassVar[Sequence[str]] = ("withassoc",)
+class Account(Association["Account"], WritableSlurmObject["Account"]):
+    query_options = ("withassoc",)
+    account: PrimaryKeyField[str]
+    parent: SyntheticField[str]
 
-    user: PrimaryStringField
-    default_account: str
+    async def set_parent(self, new_paernt):
+        filters = {"Account": self.account}
+        updates = {"parent": new_paernt}
+        await self._scattmgr_write("modify", updates, filters)
+        del self.parent
+        self.parent = new_paernt
+        await self.refresh_from_db()
 
-    @async_property
-    async def account(self) -> Account | None:
-        try:
-            return await Account.get(account=self.default_account)
-        except NotFound:
-            return None
+
+class User(Association["User"], WritableSlurmObject["User"]):
+    query_options = ("withassoc",)
+
+    user: PrimaryKeyField[str]
+    account: PrimaryKeyField[str]
+    default_account: WriteOnlyField[str | None] = None
 
     async def set_account(self, new_account: Account):
-        old_account = self.account
+        old_account = self
 
         # create a new user to generate the association with User + Account
-        new_user = self.copy()
+        new_user = copy(self)
         del new_user.default_account
         new_user.default_account = new_account.account
         updates, filters = new_user._to_query()
@@ -426,45 +518,23 @@ class User(AssociationBaseObject["User"], SlurmObject["User"]):
 
         await self.refresh_from_db()
 
-    @async_property
-    async def association(self) -> Association:
-        return await Association.get(user=self.user, account=self.default_account)
+    async def set_new_username(self, new_name: str):
+        if not new_name:
+            raise SlurmAccountManagerError("can't set an empty name for a user")
+        filters = {"User": self.user}
+        updates = {"NewName": new_name}
+        await self._scattmgr_write("modify", updates, filters)
+        del self.user
+        self.user = new_name
+        await self.refresh_from_db()
 
     @cached_property
     def home_directory(self) -> str | None:
         return find_home_directory(self.user)
 
 
-@dataclasses.dataclass
-class Account(AssociationBaseObject["Account"], SlurmObject["Account"]):
-    account: PrimaryStringField
-
-    @async_property
-    async def association(self) -> Association:
-        return await Association.get(user="", account=self.account)
-
-
-@dataclasses.dataclass
-class Association(AssociationBaseObject["Association"], SlurmObject["Association"]):
-    cluster: PrimaryStringField
-    account: PrimaryStringField
-    user: PrimaryStringField
-    partition: str
-
-    @async_property
-    async def association(self) -> Association:
-        return self
-
-    def __repr__(self):
-        if self.user:
-            return f"User {self.user}"
-
-        return f"Account {self.account}"
-
-
-@dataclasses.dataclass
 class QOS(SlurmObject["QOS"]):
-    user: PrimaryStringField
+    user: PrimaryKeyField[str]
     default_account: str
     grp_tres_mins: str
     grp_tres_run_mins: str

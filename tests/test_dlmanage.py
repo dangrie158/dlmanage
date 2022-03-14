@@ -1,4 +1,4 @@
-from manage_cluster import __version__
+from dlmanage import __version__
 
 
 def test_version():

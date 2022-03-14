@@ -21,12 +21,16 @@ from rich.text import Text
 from rich.panel import Panel
 from rich.padding import PaddingDimensions
 from rich.console import RenderableType
+from rich.status import Status
+from rich.align import Align
 
 from textual import events
+from textual.app import App
 from textual.reactive import Reactive
 from textual.widget import Widget
 from textual.message import Message, MessageTarget
 from textual.messages import CursorMove
+from textual.binding import Bindings
 
 TablePosition = NamedTuple("TablePosition", (("column", str), ("row", int)))
 
@@ -39,9 +43,9 @@ class TableTheme:
     hovered_cell = Style(bold=True)
     hovered_editable_cell = Style(bold=True, underline=True)
     selected_row = Style(bgcolor="gray19")
-    focused_cell = Style(color="#E08D6D", bgcolor="gray30", bold=True)
+    focused_cell = Style(color="green3", bgcolor="gray30", bold=True)
     disabled_row = Style(italic=True, color="grey50")
-    editing_cell = Style(color="#E08D6D", bgcolor="gray30", bold=True, underline=False)
+    editing_cell = Style(color="green3", bgcolor="gray30", bold=True, underline=False)
     cursor = Style(reverse=True, blink=True, underline=True)
     undefined_value = Style(italic=True, color="grey50")
 
@@ -58,10 +62,12 @@ class TableCell(Widget):
         style: Optional[Style] = None,
         theme: Optional[TableTheme] = None,
         placeholder: str = "<undefined>",
+        hint: Optional[str] = None,
     ):
         super().__init__(f"TableCell<{position.column}:{position.row}>")
         self.position = position
         self.placeholder = placeholder
+        self.hint = hint
         self.text = text
         self.theme = theme or TableTheme()
         style = style or self.theme.cell
@@ -76,6 +82,8 @@ class TableCell(Widget):
         if text is None:
             style += self.theme.undefined_value
             text = self.placeholder
+        elif self.hint is not None:
+            text += f" {self.hint}"
 
         if self.is_focused:
             style += self.theme.focused_cell
@@ -84,7 +92,14 @@ class TableCell(Widget):
         elif self.is_hovered:
             style += self.theme.hovered_cell
 
-        return Text(text, style=self.base_style + style)
+        render_text = Text(text, style=self.base_style + style)
+        # style the hint (if we have one)
+        if self.text is not None:
+            render_text.stylize(self.theme.undefined_value, len(self.text))
+        return render_text
+
+    async def on_key(self, event: events.Key) -> None:
+        pass
 
     def focus(self):
         self.is_focused = True
@@ -97,9 +112,6 @@ class TableCell(Widget):
 
     def hover_leave(self):
         self.is_hovered = False
-
-    async def on_key(self, event: events.Key) -> None:
-        pass
 
 
 class EditableTableCell(TableCell):
@@ -115,16 +127,19 @@ class EditableTableCell(TableCell):
         style: Optional[Style] = None,
         theme: Optional[TableTheme] = None,
         placeholder: str = "<undefined>",
+        hint: Optional[str] = None,
     ):
         theme = theme or TableTheme()
         style = style or theme.text_cell
         super().__init__(
-            position, text, style=style, theme=theme, placeholder=placeholder
+            position, text, style=style, theme=theme, placeholder=placeholder, hint=hint
         )
 
     async def begin_editing(self):
-        self.value = self.text or " "
+        self.value = self.text or ""
         self.is_editing = True
+        self.cursor_position = len(self.value)
+        await self.emit(CellStartedEditing(self, self.position))
 
     async def abort_edit(self):
         self.is_editing = False
@@ -149,7 +164,7 @@ class EditableTableCell(TableCell):
     def render(self) -> RenderableType:
         if self.is_editing:
             style = self.theme.editing_cell
-            text = self.value
+            text = self.value + " "
             cell_content = Text(text, style=self.base_style + style)
             cell_content.stylize(
                 self.theme.cursor, self.cursor_position, self.cursor_position + 1
@@ -167,16 +182,31 @@ class EditableTableCell(TableCell):
 
     async def on_key(self, event: events.Key) -> None:
         if not self.is_editing:
-            return
+            match (event.key):
+                # allow deleting the cell without entering edit mode
+                case "ctrl+h" | "delete":
+                    event.stop()
+                    self.value = ""
+                    await self.commit_edit()
+                    return
+                case other:
+                    # excel style editing a hovered cell clears the content
+                    if other.isprintable() and len(other) == 1:
+                        event.stop()
+                        await self.begin_editing()
+                        await self.emit(event)
+                        self.value = ""
+                    return
 
         event.stop()
         match (event.key):
             case "ctrl+h":  # backspace
-                self.value = (
-                    self.value[0 : self.cursor_position - 1]
-                    + self.value[self.cursor_position :]
-                )
-                self.cursor_position -= 1
+                if self.cursor_position > 0:
+                    self.value = (
+                        self.value[0 : self.cursor_position - 1]
+                        + self.value[self.cursor_position :]
+                    )
+                    self.cursor_position -= 1
             case "delete":
                 self.value = (
                     self.value[0 : self.cursor_position]
@@ -194,7 +224,7 @@ class EditableTableCell(TableCell):
                 if self.cursor_position > 0:
                     self.cursor_position -= 1
             case "right":
-                if self.cursor_position < len(self.value) - 1:
+                if self.cursor_position < len(self.value):
                     self.cursor_position += 1
             case other:
                 if other.isprintable() and len(other) == 1:
@@ -210,6 +240,7 @@ class EditableIntTableCell(EditableTableCell):
         style: Optional[Style] = None,
         theme: Optional[TableTheme] = None,
         placeholder: str = "<undefined>",
+        hint: Optional[str] = None,
         max_val: Optional[int] = None,
         min_val: Optional[int] = None,
     ):
@@ -219,7 +250,7 @@ class EditableIntTableCell(EditableTableCell):
         theme = theme or TableTheme()
         style = style or theme.int_cell
         super().__init__(
-            position, text, style=style, theme=theme, placeholder=placeholder
+            position, text, style=style, theme=theme, placeholder=placeholder, hint=hint
         )
 
     async def begin_editing(self):
@@ -228,6 +259,8 @@ class EditableIntTableCell(EditableTableCell):
         self.is_editing = True
 
     def to_value(self) -> Any:
+        if not self.value.strip():
+            return None
         value = int(self.value)
         if self.max_val is not None:
             value = min(self.max_val, value)
@@ -238,9 +271,12 @@ class EditableIntTableCell(EditableTableCell):
     def input_key(self, key_name: str) -> None:
         match (key_name):
             case "+":
-                with suppress(ValueError):
+                try:
                     if self.max_val is None or self.to_value() < self.max_val:
                         self.value = str(int(self.value) + 1)
+                except ValueError:
+                    # value was None, 1 seems like a good starting point
+                    self.value = "1"
             case "-":
                 with suppress(ValueError):
                     if self.min_val is None or self.to_value() > self.min_val:
@@ -259,14 +295,17 @@ class EditableChoiceTableCell(EditableTableCell):
         style: Optional[Style] = None,
         theme: Optional[TableTheme] = None,
         placeholder: str = "<undefined>",
+        hint: Optional[str] = None,
         choices: Optional[Sequence[str]] = None,
+        selected_index: Optional[int] = 0,
     ):
         self.choices = choices or ([text] if text else [])
 
         theme = theme or TableTheme()
         style = style or theme.choice_cell
+        self.selected_index = selected_index
         super().__init__(
-            position, text, style=style, theme=theme, placeholder=placeholder
+            position, text, style=style, theme=theme, placeholder=placeholder, hint=hint
         )
 
     def to_value(self):
@@ -283,7 +322,7 @@ class EditableChoiceTableCell(EditableTableCell):
                 if choice == self.value:
                     style += self.theme.choice_cell
 
-                selector = "◉" if choice == self.value else "○"
+                selector = "◉" if index == self.selected_index else "○"
                 choice_list += Text(
                     f"{selector} {choice.rjust(max_choice_len)}\n", style
                 )
@@ -294,7 +333,7 @@ class EditableChoiceTableCell(EditableTableCell):
     async def begin_editing(self):
         await super().begin_editing()
         try:
-            self.cursor_position = self.choices.index(self.text)
+            self.cursor_position = self.selected_index
         except ValueError:
             self.cursor_position = 0
 
@@ -329,6 +368,16 @@ class EditableChoiceTableCell(EditableTableCell):
 
 
 @rich.repr.auto
+class CellStartedEditing(Message):
+    def __init__(self, sender: MessageTarget, position: TablePosition) -> None:
+        self.position = position
+        super().__init__(sender)
+
+    def __rich_repr__(self) -> rich.repr.Result:
+        yield "position", self.position
+
+
+@rich.repr.auto
 class CellEdited(Message):
     def __init__(
         self, sender: MessageTarget, position: TablePosition, new_content: str
@@ -353,8 +402,12 @@ class CellFinishedEditing(Message):
         yield "new_content", self.new_content
 
 
-class InteractiveTableModel(ABC):
+class InteractiveTableModel(ABC, Bindings):
     title: str
+
+    def __init__(self, app: App) -> None:
+        super().__init__()
+        self.app = app
 
     @abstractmethod
     async def load_data(self):
@@ -389,7 +442,7 @@ class InteractiveTableModel(ABC):
         return TableCell, {}
 
     @abstractmethod
-    async def get_cell(self, position: TablePosition) -> str:
+    async def get_cell(self, position: TablePosition) -> str | None:
         ...
 
     def get_primary_column(self) -> str:
@@ -446,7 +499,7 @@ class InteractiveTableModel(ABC):
         candidates += list(range(0, current_row))
         for row in candidates:
             value = await self.get_cell(TablePosition(search_column, row))
-            if value.startswith(needle):
+            if value is not None and value.startswith(needle):
                 return row
         return None
 
@@ -456,6 +509,7 @@ class InteractiveTable(Widget):
     hover_position: Reactive[Optional[TablePosition]] = Reactive(None, layout=True)
     is_in_edit_mode: Reactive[bool] = Reactive(False)
     model: Reactive[Optional[InteractiveTableModel]] = Reactive(None, layout=True)
+    is_loading: Reactive[bool] = Reactive(False)
 
     _refresh_data_lock: threading.Lock = threading.Lock()
 
@@ -472,11 +526,18 @@ class InteractiveTable(Widget):
         self.columns: Sequence[str] = []
         self.num_rows: int = 0
 
+        self._spinner = Status(
+            "Loading data",
+            spinner="aesthetic",
+        )
+
         super().__init__(name=name)
         self.padding = padding
 
     async def watch_model(self, new_model: InteractiveTableModel):
+        self.is_loading = True
         await self.refresh_data_from_model()
+        self.is_loading = False
 
     async def refresh_data_from_model(self):
         with self._refresh_data_lock:
@@ -506,7 +567,7 @@ class InteractiveTable(Widget):
             self.cells[old_value].unfocus()
 
         if new_value is not None and new_value in self.cells:
-            self.emit_no_wait(CursorMove(self, new_value.row + self.gutter.top))
+            self.emit_no_wait(CursorMove(self, new_value.row))
             self.cells[new_value].focus()
 
     def watch_hover_position(
@@ -518,8 +579,10 @@ class InteractiveTable(Widget):
             self.cells[new_value].hover_enter()
 
     def render(self) -> RenderableType:
-        if self.model is None or self._refresh_data_lock.locked():
-            return Panel(Text("Loading"), title="loading")
+        if self.model is None:
+            return Panel(Text("Select a model for editing"))
+        if self.is_loading or self._refresh_data_lock.locked():
+            return Align.center(self._spinner.renderable, vertical="middle")
 
         table = Table(expand=True, highlight=True)
 
@@ -546,6 +609,8 @@ class InteractiveTable(Widget):
         return table
 
     async def on_click(self, event: events.Click) -> None:
+        if not self.can_focus:
+            return
         if self.is_in_edit_mode:
             return
         column, row = event.style.meta.get("column"), event.style.meta.get("row")
@@ -556,6 +621,8 @@ class InteractiveTable(Widget):
         self.selection_position = TablePosition(column, row)
 
     async def on_mouse_move(self, event: events.MouseMove) -> None:
+        if not self.can_focus:
+            return
         column, row = event.style.meta.get("column"), event.style.meta.get("row")
         if None in (column, row):
             self.hover_position = None
@@ -564,6 +631,9 @@ class InteractiveTable(Widget):
         self.hover_position = TablePosition(column, row)
 
     async def on_key(self, event: events.Key) -> None:
+        if not self.can_focus:
+            return
+        self.hover_position = None
         if (
             self.selection_position is not None
             and self.selection_position in self.cells
@@ -577,6 +647,7 @@ class InteractiveTable(Widget):
 
         match (event.key):
             case "up":
+                event.stop()
                 if self.selection_position is None:
                     self.selection_position = TablePosition("", self.num_rows - 1)
                     return
@@ -586,6 +657,7 @@ class InteractiveTable(Widget):
                         self.selection_position.column, self.selection_position.row - 1
                     )
             case "down":
+                event.stop()
                 if self.selection_position is None:
                     self.selection_position = TablePosition("", 0)
                     return
@@ -595,6 +667,7 @@ class InteractiveTable(Widget):
                         self.selection_position.column, self.selection_position.row + 1
                     )
             case "left":
+                event.stop()
                 if self.selection_position is None:
                     return
 
@@ -606,6 +679,7 @@ class InteractiveTable(Widget):
                         previous_column, self.selection_position.row
                     )
             case "right":
+                event.stop()
                 if self.selection_position is None:
                     return
 
@@ -615,6 +689,7 @@ class InteractiveTable(Widget):
                         next_column, self.selection_position.row
                     )
             case "enter":
+                event.stop()
                 if (
                     self.selection_position is not None
                     and self.selection_position in self.cells
@@ -626,6 +701,7 @@ class InteractiveTable(Widget):
                         self.is_in_edit_mode = True
             case other:
                 if other.isalnum() and len(other) == 1:
+                    event.stop()
                     current_position = (
                         self.selection_position
                         if self.selection_position is not None
@@ -639,12 +715,14 @@ class InteractiveTable(Widget):
                             current_position.column, next_row
                         )
 
+    async def handle_cell_started_editing(self, event: CellFinishedEditing):
+        self.is_in_edit_mode = True
+
     async def handle_cell_finished_editing(self, event: CellFinishedEditing):
         self.is_in_edit_mode = False
 
     async def handle_cell_edited(self, event: CellEdited):
         await self.model.on_cell_update(event.position, event.new_content)
-        # TODO: place this somewhere nice
         await self.model.load_data()
         await self.refresh_data_from_model()
         self.refresh()
