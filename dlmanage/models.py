@@ -5,7 +5,7 @@ from rich.tree import Tree
 from rich.console import Console
 from textual.app import App
 
-from dlmanage.widgets.interactive_table import (
+from widgets.interactive_table import (
     EditableChoiceTableCell,
     EditableIntTableCell,
     EditableTableCell,
@@ -14,14 +14,14 @@ from dlmanage.widgets.interactive_table import (
     TableCell,
     TablePosition,
 )
-from dlmanage.slurmbridge import (
+from slurmbridge.objects import (
     Job,
     SlurmAccountManagerError,
-    SlurmObjectException,
     User,
     Account,
     Association,
 )
+from slurmbridge.common import SlurmObjectException
 
 
 def get_association_with_lowest_grp_tres(

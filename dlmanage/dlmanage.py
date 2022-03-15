@@ -4,18 +4,17 @@ from textual import events
 from textual.app import App
 from textual.widgets import Header, ScrollView, TreeControl, TreeClick
 from textual.widget import Widget
-from textual.binding import NoBinding
 from textual import actions
 
-from dlmanage.widgets import (
+from widgets import (
     Footer,
     InteractiveTableModel,
     InteractiveTable,
     TableTheme,
 )
 
-from dlmanage.models import AssociationListModel, JobListModel
-from dlmanage.widgets.footer import ErrorDismissed, PromptResponse
+from models import AssociationListModel, JobListModel
+from widgets.footer import ErrorDismissed, PromptResponse
 
 
 class AppTheme(TableTheme):
@@ -167,3 +166,7 @@ class SlurmControl(App):
 
 def main():
     SlurmControl.run(title="Slurm Control")
+
+
+if __name__ == "__main__":
+    main()
