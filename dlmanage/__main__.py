@@ -5,6 +5,7 @@ from textual.app import App
 from textual.widgets import Header, ScrollView, TreeControl, TreeClick
 from textual.widget import Widget
 from textual.binding import NoBinding
+from textual import actions
 
 from dlmanage.widgets import (
     Footer,
@@ -14,7 +15,7 @@ from dlmanage.widgets import (
 )
 
 from dlmanage.models import AssociationListModel, JobListModel
-from dlmanage.widgets.footer import PromptResponse
+from dlmanage.widgets.footer import ErrorDismissed, PromptResponse
 
 
 class AppTheme(TableTheme):
@@ -37,8 +38,9 @@ class AppTheme(TableTheme):
 
 class SlurmControl(App):
     theme = AppTheme()
-    model: InteractiveTableModel
+    model: InteractiveTableModel | None = None
     footer: Footer
+    current_response_action: str | None = None
 
     async def on_load(self, event: events.Load) -> None:
         await self.bind("q", "quit", "Quit")
@@ -71,7 +73,7 @@ class SlurmControl(App):
 
         # initially set the focus to the sidebar so we can steal it after loading the model
         await self.set_focus(self.sidebar_content)
-        await self.load_model(AssociationListModel(self))
+        await self.load_model(AssociationListModel(self, self.main_content))
 
     async def set_focus(self, widget: Widget | None) -> None:
         if self.focused == widget:
@@ -91,7 +93,13 @@ class SlurmControl(App):
 
     async def load_model(self, model: InteractiveTableModel) -> None:
         self.main_content.is_loading = True
+        # unregister the bindings from the old model
+        if self.model is not None:
+            for key in self.model.keys.keys():
+                del self.bindings.keys[key]
+
         self.model = model
+        # register the new model bindings
         if model is not None:
             self._action_targets.add("model")
             for binding in model.keys.values():
@@ -115,28 +123,46 @@ class SlurmControl(App):
             return
         model_class = message.node.data
         if model_class is not None and issubclass(model_class, InteractiveTableModel):
-            model = model_class(self)
+            model = model_class(self, self.main_content)
             await self.load_model(model)
 
-    async def prompt(self, message: str):
+    async def prompt(self, message: str, response_action: str):
         await self.set_focus(self.footer)
         self.main_content.can_focus = False
         self.sidebar_content.can_focus = False
+        self.current_response_action = response_action
         self.footer.prompt(message)
 
-    async def confirm(self, message: str):
+    async def confirm(self, message: str, response_action: str):
         await self.set_focus(self.footer)
         self.main_content.can_focus = False
         self.sidebar_content.can_focus = False
+        self.current_response_action = response_action
         self.footer.confirm(message)
 
-    async def display_error(self, error: Exception):
-        self.footer.show_error(str(error))
-
     async def handle_prompt_response(self, message: PromptResponse):
-        await self.set_focus(self.main_content)
+        if self.current_response_action is None:
+            raise AssertionError("unexpected prompt response")
         self.main_content.can_focus = True
         self.sidebar_content.can_focus = True
+        await self.set_focus(self.main_content)
+        action_name, fixed_args = actions.parse(self.current_response_action)
+        response_args = (message.response, message.confirmed)
+        action_args = ", ".join([repr(arg) for arg in fixed_args + response_args])
+        action_to_fire = f"{action_name}({action_args})"
+        await self.action(action_to_fire)
+        self.current_response_action = None
+
+    async def display_error(self, error: Exception):
+        await self.set_focus(self.footer)
+        self.main_content.can_focus = False
+        self.sidebar_content.can_focus = False
+        self.footer.show_error(str(error))
+
+    async def handle_error_dismissed(self, message: ErrorDismissed):
+        self.main_content.can_focus = True
+        self.sidebar_content.can_focus = True
+        await self.set_focus(self.main_content)
 
 
 if __name__ == "__main__":

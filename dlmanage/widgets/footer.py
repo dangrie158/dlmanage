@@ -22,8 +22,13 @@ class PromptResponse(Message):
         super().__init__(sender)
 
     def __rich_repr__(self) -> rich.repr.Result:
-        yield "position", self.position
-        yield "new_content", self.new_content
+        yield "response", self.response
+        yield "confirmed", self.confirmed
+
+
+@rich.repr.auto
+class ErrorDismissed(Message):
+    pass
 
 
 @rich.repr.auto
@@ -104,6 +109,7 @@ class Footer(Widget):
     async def on_key(self, event: events.Key):
         # clear the error on every keystroke
         if self.error_message is not None:
+            await self.emit(ErrorDismissed(self))
             self.error_message = None
 
         if self.prompt_message is None:
@@ -116,7 +122,7 @@ class Footer(Widget):
             case "escape":
                 event.stop()
                 await self._finish_prompt(confirm=False)
-            case "delete":
+            case "ctrl+h":
                 event.stop()
                 self.prompt_response = self.prompt_response[:-1]
             case other:
@@ -133,19 +139,20 @@ class Footer(Widget):
 
     def prompt(self, message: str):
         self.prompt_response = ""
-        self.prompt_message = message
+        self.prompt_message = f"{message} [ESC to cancel]"
 
     def confirm(self, message: str):
         self.is_awaiting_confirm = True
-        self.prompt(f"{message} [Y/n]")
+        self.prompt_response = ""
+        self.prompt_message = f"{message} [Y/n/esc]:"
 
     def show_error(self, message: str):
         self.error_message = message
         self.console.bell()
 
     async def _finish_prompt(self, confirm: bool):
+        await self.emit(PromptResponse(self, self.prompt_response, confirm))
         self.is_awaiting_confirm = False
         self.prompt_message = None
         self.prompt_response = ""
-        await self.emit(PromptResponse(self, self.prompt_response, confirm))
         self.refresh()

@@ -1,4 +1,4 @@
-from typing import Any, Dict, Mapping, Sequence, Tuple, Type
+from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple, Type
 from io import StringIO
 
 from rich.tree import Tree
@@ -10,10 +10,12 @@ from dlmanage.widgets.interactive_table import (
     EditableIntTableCell,
     EditableTableCell,
     InteractiveTableModel,
+    InteractiveTable,
     TableCell,
     TablePosition,
 )
 from dlmanage.slurmbridge import (
+    Job,
     SlurmAccountManagerError,
     SlurmObjectException,
     User,
@@ -65,7 +67,12 @@ def get_bottleneck_hint(
 
 def build_account_tree(root_node: Association) -> Sequence[str]:
     def build_tree(tree: Tree, root: Association):
-        node = tree.add(root.account)
+        node: Tree
+        if isinstance(root, User):
+            node = tree.add(root.user)
+        else:
+            node = tree.add(root.account)
+
         for child in root.children:
             build_tree(node, child)
 
@@ -80,9 +87,9 @@ def build_account_tree(root_node: Association) -> Sequence[str]:
 class AssociationListModel(InteractiveTableModel):
     title = "Users and Groups"
 
-    def __init__(self, app: App):
-        super().__init__(app)
-        self._columns = {
+    def __init__(self, app: App, table_widget: InteractiveTable):
+        super().__init__(app, table_widget)
+        self._columns: Mapping[str, Mapping[str, Any]] = {
             "account": {"ratio": 3, "no_wrap": True},
             "user": {"ratio": 2, "no_wrap": True},
             "CPUs": {"justify": "center", "ratio": 2, "no_wrap": True},
@@ -93,19 +100,88 @@ class AssociationListModel(InteractiveTableModel):
 
         self.bind("ctrl+a", "add_account", "Add a new Account")
         self.bind("ctrl+u", "add_user", "Add a new User")
+        self.bind("ctrl+d", "delete_entry", "Delete Entry")
 
     async def action_add_account(self):
-        await self.app.prompt("Enter the new accountname")
+        current_selection = self.table_widget.selection_position or TablePosition("", 0)
+        await self.app.prompt(
+            "Enter the new accountname",
+            f"model.accountname_entered('{current_selection.column}', {current_selection.row})",
+        )
+
+    async def action_accountname_entered(
+        self, column: str, row: int, accountname: str, confirmed: bool
+    ):
+        if confirmed:
+            try:
+                await Account.create(account=accountname)
+                await self.refresh()
+                next_row = await self.get_next_row_matching(
+                    0, accountname, ("account",)
+                )
+                if next_row is not None:
+                    self.table_widget.selection_position = TablePosition("", next_row)
+            except (SlurmAccountManagerError, SlurmObjectException) as error:
+                await self.app.display_error(error)
 
     async def action_add_user(self):
-        await self.app.prompt("Enter the new username")
+        current_selection = self.table_widget.selection_position or TablePosition("", 0)
+        await self.app.prompt(
+            "Enter the new username",
+            f"model.username_entered('{current_selection.column}', {current_selection.row})",
+        )
+
+    async def action_username_entered(
+        self, column: str, row: int, username: str, confirmed: bool
+    ):
+        if confirmed:
+            try:
+                await User.create(user=username, account="root")
+                await self.refresh()
+                next_row = await self.get_next_row_matching(0, username, ("user",))
+                if next_row:
+                    self.table_widget.selection_position = TablePosition(
+                        column, next_row
+                    )
+            except (SlurmAccountManagerError, SlurmObjectException) as error:
+                await self.app.display_error(error)
+
+    async def action_delete_entry(self):
+        current_selection = self.table_widget.selection_position
+        if current_selection is None:
+            await self.app.display_error("Nothing selected")
+            return
+        object_to_delete = self._data[current_selection.row]
+        await self.app.confirm(
+            f"Do you really want to delete the {object_to_delete}",
+            f"model.delete_confirmed('{current_selection.column}', {current_selection.row})",
+        )
+
+    async def action_delete_confirmed(
+        self, column: str, row: int, reponse: str, confirmed: bool
+    ):
+        if confirmed:
+            object_to_delete = self._data[row]
+            try:
+                await object_to_delete.delete()
+                await self.refresh()
+                self.table_widget.selection_position = TablePosition(
+                    column, min(row, len(self._data) - 1)
+                )
+            except (SlurmAccountManagerError, SlurmObjectException) as error:
+                await self.app.display_error(error)
 
     async def load_data(self):
         self._data = await Association.all()
         self._available_accounts = await Account.all()
         self.account_tree = build_account_tree(self._data[0])
 
-    def get_columns(self) -> Sequence[str]:
+    async def refresh(self):
+        await self.load_data()
+        await self.table_widget.refresh_data_from_model()
+        self.table_widget.refresh()
+
+    def get_columns(self) -> Iterable[str]:
         return self._columns.keys()
 
     def get_num_rows(self) -> int:
@@ -175,14 +251,14 @@ class AssociationListModel(InteractiveTableModel):
             case "CPUs":
                 hint, placeholder = get_bottleneck_hint(row_object, "max_cpus")
                 return EditableIntTableCell, {
-                    "min_val": 0,
+                    "min_value": 0,
                     "placeholder": placeholder,
                     "hint": hint,
                 }
             case "GPUs":
                 hint, placeholder = get_bottleneck_hint(row_object, "max_gpus")
                 return EditableIntTableCell, {
-                    "min_val": 0,
+                    "min_value": 0,
                     "placeholder": placeholder,
                     "hint": hint,
                 }
@@ -199,10 +275,23 @@ class AssociationListModel(InteractiveTableModel):
             match position.column:
                 case "account":
                     new_account = await Account.get(account=new_value)
+                    next_row = None
                     if isinstance(affected_object, User):
                         await affected_object.set_account(new_account)
+                        await self.load_data()
+                        next_row = await self.get_next_row_matching(
+                            0, affected_object.user, ("user",)
+                        )
                     else:
                         await affected_object.set_parent(new_account.account)
+                        await self.load_data()
+                        next_row = await self.get_next_row_matching(
+                            0, affected_object.account, ("account",)
+                        )
+                    if next_row is not None:
+                        self.table_widget.selection_position = TablePosition(
+                            "account", next_row
+                        )
                 case "user":
                     await affected_object.set_new_username(new_value)
                 case "CPUs":
@@ -212,19 +301,87 @@ class AssociationListModel(InteractiveTableModel):
                     affected_object.max_gpus = new_value
                     await affected_object.save()
                 case "Timelimit":
+                    if new_value is None:
+                        new_value = "-1"
                     affected_object.grp_wall = new_value
                     await affected_object.save()
                 case unknown_name:
                     raise AttributeError(f"Can't update column {unknown_name}")
+            await self.refresh()
         except (SlurmAccountManagerError, SlurmObjectException) as error:
             await self.app.display_error(error)
 
-    async def on_row_delete(self, position: TablePosition) -> None:
+
+class JobListModel(InteractiveTableModel):
+    def __init__(self, app: App):
+        super().__init__(app)
+        self._columns: Mapping[str, Mapping[str, Any]] = {
+            "user": {"ratio": 2, "no_wrap": True},
+            "Job ID": {"ratio": 2, "no_wrap": True},
+            "CPUs": {"justify": "center", "ratio": 1, "no_wrap": True},
+            "GPUs": {"justify": "center", "ratio": 1, "no_wrap": True},
+            "Memory": {"justify": "center", "ratio": 1, "no_wrap": True},
+            "Timelimit": {"justify": "right", "ratio": 2, "no_wrap": True},
+            "Runtime": {"justify": "right", "ratio": 2, "no_wrap": True},
+        }
+
+        self.bind("ctrl+x", "cancel_job", "Cancel Job")
+        self.bind("ctrl+h", "hold_job", "Put on Hold")
+        self.bind("ctrl+r", "unhold_job", "Remove Hold")
+
+    async def load_data(self):
+
+        self._data = Job.all()
+
+    def get_columns(self) -> Iterable[str]:
+        return self._columns.keys()
+
+    def get_num_rows(self) -> int:
+        return len(self._data)
+
+    def get_column_kwargs(self, column_name: str) -> Mapping[str, Any]:
+        return self._columns.get(column_name, {})
+
+    async def get_cell(self, position: TablePosition) -> str | None:
+        row_object = self._data[position.row]
+        match (position.column):
+            case "user":
+                return row_object.user_id
+            case "Job ID":
+                cell_text = row_object.job_id
+                if row_object.array_task_id is not None:
+                    cell_text += f"[{row_object.array_task_id}]"
+                return cell_text
+            case "CPUs":
+                return row_object.cpus
+            case "GPUs":
+                return row_object.gpus
+            case "Memory":
+                return row_object.mem
+            case "Timelimit":
+                return row_object.run_time
+            case "Runtime":
+                cell_text = row_object.run_time
+                if row_object.job_state != "RUNNING":
+                    cell_text = row_object.job_state
+                    if row_object.reason is not None:
+                        cell_text += f" ({row_object.reason})"
+                return cell_text
+            case unknown_name:
+                raise AttributeError(f"Unknown column: {unknown_name}")
+
+    async def get_cell_class(
+        self, position: TablePosition
+    ) -> Tuple[Type[TableCell], Dict[str, Any]]:
+        match (position.column):
+            case "user" | "Job ID" | "Runtime":
+                return TableCell, {}
+            case "CPUs" | "GPUs":
+                return EditableIntTableCell, {"min_value": 0}
+            case "Memory" | "Timelimit":
+                return EditableTableCell, {}
+            case unknown_name:
+                raise AttributeError(f"Unknown column: {unknown_name}")
+
+    async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
         pass
-
-    async def on_row_add(self, position: TablePosition) -> None:
-        pass
-
-
-class JobListModel(AssociationListModel):
-    pass

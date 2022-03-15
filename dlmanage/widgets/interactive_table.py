@@ -5,6 +5,7 @@ import threading
 from typing import (
     Any,
     Dict,
+    Iterable,
     Mapping,
     NamedTuple,
     Optional,
@@ -241,11 +242,11 @@ class EditableIntTableCell(EditableTableCell):
         theme: Optional[TableTheme] = None,
         placeholder: str = "<undefined>",
         hint: Optional[str] = None,
-        max_val: Optional[int] = None,
-        min_val: Optional[int] = None,
+        max_value: Optional[int] = None,
+        min_value: Optional[int] = None,
     ):
-        self.min_val = min_val
-        self.max_val = max_val
+        self.min_value = min_value
+        self.max_value = max_value
 
         theme = theme or TableTheme()
         style = style or theme.int_cell
@@ -262,24 +263,24 @@ class EditableIntTableCell(EditableTableCell):
         if not self.value.strip():
             return None
         value = int(self.value)
-        if self.max_val is not None:
-            value = min(self.max_val, value)
-        if self.min_val is not None:
-            value = max(self.min_val, value)
+        if self.max_value is not None:
+            value = min(self.max_value, value)
+        if self.min_value is not None:
+            value = max(self.min_value, value)
         return value
 
     def input_key(self, key_name: str) -> None:
         match (key_name):
             case "+":
                 try:
-                    if self.max_val is None or self.to_value() < self.max_val:
+                    if self.max_value is None or self.to_value() < self.max_value:
                         self.value = str(int(self.value) + 1)
                 except ValueError:
                     # value was None, 1 seems like a good starting point
                     self.value = "1"
             case "-":
                 with suppress(ValueError):
-                    if self.min_val is None or self.to_value() > self.min_val:
+                    if self.min_value is None or self.to_value() > self.min_value:
                         self.value = str(int(self.value) - 1)
             case other:
                 if other.isnumeric():
@@ -405,16 +406,17 @@ class CellFinishedEditing(Message):
 class InteractiveTableModel(ABC, Bindings):
     title: str
 
-    def __init__(self, app: App) -> None:
+    def __init__(self, app: App, table_widget: InteractiveTable) -> None:
         super().__init__()
         self.app = app
+        self.table_widget = table_widget
 
     @abstractmethod
     async def load_data(self):
         ...
 
     @abstractmethod
-    def get_columns(self) -> Sequence[str]:
+    def get_columns(self) -> Iterable[str]:
         ...
 
     @abstractmethod
@@ -423,14 +425,6 @@ class InteractiveTableModel(ABC, Bindings):
 
     @abstractmethod
     async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
-        ...
-
-    @abstractmethod
-    async def on_row_delete(self, position: TablePosition) -> None:
-        ...
-
-    @abstractmethod
-    async def on_row_add(self, position: TablePosition) -> None:
         ...
 
     def get_column_kwargs(self, column_name: str) -> Mapping[str, Any]:
@@ -491,16 +485,22 @@ class InteractiveTableModel(ABC, Bindings):
             pass
         return None
 
-    async def get_next_row_matching(self, current_row: int, needle: str) -> int | None:
-        search_column = self.get_primary_column()
+    async def get_next_row_matching(
+        self,
+        current_row: int,
+        needle: str,
+        search_columns: Optional[Sequence[str]] = None,
+    ) -> int | None:
+        search_columns = search_columns or [self.get_primary_column()]
 
         total_rows = self.get_num_rows()
         candidates = list(range(current_row + 1, total_rows))
         candidates += list(range(0, current_row))
         for row in candidates:
-            value = await self.get_cell(TablePosition(search_column, row))
-            if value is not None and value.startswith(needle):
-                return row
+            for columns in search_columns:
+                value = await self.get_cell(TablePosition(columns, row))
+                if value is not None and needle in value:
+                    return row
         return None
 
 
@@ -699,21 +699,6 @@ class InteractiveTable(Widget):
                         await cell.begin_editing()
                         self.refresh()
                         self.is_in_edit_mode = True
-            case other:
-                if other.isalnum() and len(other) == 1:
-                    event.stop()
-                    current_position = (
-                        self.selection_position
-                        if self.selection_position is not None
-                        else TablePosition("", 0)
-                    )
-                    next_row = await self.model.get_next_row_matching(
-                        current_position.row, other
-                    )
-                    if next_row is not None:
-                        self.selection_position = TablePosition(
-                            current_position.column, next_row
-                        )
 
     async def handle_cell_started_editing(self, event: CellFinishedEditing):
         self.is_in_edit_mode = True
@@ -723,6 +708,3 @@ class InteractiveTable(Widget):
 
     async def handle_cell_edited(self, event: CellEdited):
         await self.model.on_cell_update(event.position, event.new_content)
-        await self.model.load_data()
-        await self.refresh_data_from_model()
-        self.refresh()

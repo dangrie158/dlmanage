@@ -184,7 +184,7 @@ class SlurmObject(ABC, Generic[ObjectType]):
         verb: str,
         *arguments: str,
         error_ok=False,
-    ) -> str:
+    ) -> Tuple[int, str]:
         if SACCTMGR_PATH is None:
             raise ImportError("sacctmgr could not be found in path.")
 
@@ -204,7 +204,7 @@ class SlurmObject(ABC, Generic[ObjectType]):
         if not error_ok and process.returncode != 0:
             raise SlurmAccountManagerError(process_output)
 
-        return process_output
+        return process.returncode, process_output
 
     @classmethod
     async def _scattmgr_show(
@@ -220,7 +220,7 @@ class SlurmObject(ABC, Generic[ObjectType]):
             for column, value in filters.items():
                 filter_args.append(f"{column}={value}")
 
-        process_output = await cls._run_scattmgr_command(
+        exit_code, process_output = await cls._run_scattmgr_command(
             "show", cls.__name__, *cls.query_options, format_string, *filter_args
         )
 
@@ -325,9 +325,17 @@ class WritableSlurmObject(SlurmObject[WritableObjectType]):
             for field_name, new_value in new_values.items():
                 update_args.append(f"{field_name}={new_value}")
 
-        process_output = await cls._run_scattmgr_command(
-            verb, cls.__name__, *filter_args, *update_args, "--immediate", error_ok=True
+        exit_code, process_output = await cls._run_scattmgr_command(
+            verb,
+            cls.__name__,
+            *filter_args,
+            *update_args,
+            "--immediate",
+            error_ok=True,
         )
+
+        if exit_code != 0:
+            raise SlurmAccountManagerError(process_output)
 
         if verb == "create":
             if "Nothing new added." in process_output:
@@ -354,13 +362,13 @@ class WritableSlurmObject(SlurmObject[WritableObjectType]):
 
     @classmethod
     async def create(cls: Type[WritableObjectType], **attrs) -> WritableObjectType:
-        new_object = cls(**attrs)
-        created = await new_object.save()
-        if not created:
-            raise AssertionError(
+        created_objects = await cls._scattmgr_write("create", attrs, {})
+        if len(created_objects) == 1:
+            return await cls.get(**attrs)
+        else:
+            raise SlurmAccountManagerError(
                 f"Failed to create new {cls.__name__}. Maybe the object already existed?"
             )
-        return new_object
 
     async def save(self) -> bool:
         created = False
@@ -492,6 +500,9 @@ class Account(Association["Account"], WritableSlurmObject["Account"]):
         self.parent = new_paernt
         await self.refresh_from_db()
 
+    def __str__(self) -> str:
+        return f"Account {self.account}"
+
 
 class User(Association["User"], WritableSlurmObject["User"]):
     query_options = ("withassoc",)
@@ -532,6 +543,9 @@ class User(Association["User"], WritableSlurmObject["User"]):
     def home_directory(self) -> str | None:
         return find_home_directory(self.user)
 
+    def __str__(self) -> str:
+        return f"User {self.user} in {self.account}"
+
 
 class QOS(SlurmObject["QOS"]):
     user: PrimaryKeyField[str]
@@ -556,3 +570,86 @@ class QOS(SlurmObject["QOS"]):
     max_submit_jobs_per_user: str
     max_tres_per_account: str
     max_tres_per_user: str
+
+
+@dataclasses.dataclass
+class Job:
+    job_id: str
+    job_name: str
+    job_state: str
+    run_time: str
+    time_limit: str
+    tres: str
+    user_id: str
+    group_id: str
+    array_task_id: Optional[str] = None
+    reason: Optional[str] = None
+
+    async def get_user(self) -> User:
+        return await User.get(user=self.user_id, account=self.group_id)
+
+    async def get_account(self) -> Account:
+        return await Account.get(account=self.group_id)
+
+    @property
+    def cpus(self) -> str | None:
+        return get_gres_value(self.tres, "cpu")
+
+    @property
+    def mem(self) -> str | None:
+        return get_gres_value(self.tres, "mem")
+
+    @property
+    def gpus(self) -> str | None:
+        return get_gres_value(self.tres, "gres/gpu")
+
+    @classmethod
+    def all(cls) -> Sequence[Job]:
+        return [
+            Job(
+                "37780",
+                "fixed-mixed-loss-05-metatrain",
+                "RUNNING",
+                "0-23:20:15",
+                "4-00:00:00",
+                "cpu=30,mem=128G,node=1,billing=4",
+                "griesshaber",
+                "employee",
+            ),
+            Job(
+                "37780",
+                "fixed-mixed-loss-05-finetune-16",
+                "PENDING",
+                "0-00:00:00",
+                "4-00:00:00",
+                "cpu=4,mem=16G,node=1,billing=4,gres/gpu=1",
+                "griesshaber",
+                "employee",
+                "0-169",
+                "Dependency",
+            ),
+            Job(
+                "37780",
+                "fixed-mixed-loss-05-finetune-8",
+                "PENDING",
+                "0-00:00:00",
+                "4-00:00:00",
+                "cpu=4,mem=16G,node=1,billing=4,gres/gpu=1",
+                "griesshaber",
+                "employee",
+                "0-169",
+                "Dependency",
+            ),
+            Job(
+                "37780",
+                "fixed-mixed-loss-05-finetune-4",
+                "PENDING",
+                "0-00:00:00",
+                "4-00:00:00",
+                "cpu=4,mem=16G,node=1,billing=4,gres/gpu=1",
+                "griesshaber",
+                "employee",
+                "0-169",
+                "Dependency",
+            ),
+        ]
