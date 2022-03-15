@@ -29,18 +29,18 @@ def get_association_with_lowest_grp_tres(
 ) -> Association:
     lowest_value = getattr(object, resource)
     parent_with_lowest_value = object
-    while object.parent is not None:
-        parent_value = getattr(object.parent, resource)
+    while object.parent_object is not None:
+        parent_value = getattr(object.parent_object, resource)
         if lowest_value is None:
             lowest_value = parent_value
             if lowest_value is not None:
-                parent_with_lowest_value = object.parent
+                parent_with_lowest_value = object.parent_object
         elif parent_value is not None:
             if int(parent_value) < int(lowest_value):
                 lowest_value = parent_value
-                parent_with_lowest_value = object.parent
+                parent_with_lowest_value = object.parent_object
 
-        object = object.parent
+        object = object.parent_object
 
     return parent_with_lowest_value
 
@@ -229,8 +229,8 @@ class AssociationListModel(InteractiveTableModel):
                         account for account in choices if account != row_object.account
                     ]
                     current_value = (
-                        row_object.parent.account
-                        if row_object.parent is not None
+                        row_object.parent_object.account
+                        if row_object.parent_object is not None
                         else ""
                     )
                 try:
@@ -313,8 +313,8 @@ class AssociationListModel(InteractiveTableModel):
 
 
 class JobListModel(InteractiveTableModel):
-    def __init__(self, app: App):
-        super().__init__(app)
+    def __init__(self, app: App, table_widget: InteractiveTable):
+        super().__init__(app, table_widget)
         self._columns: Mapping[str, Mapping[str, Any]] = {
             "user": {"ratio": 2, "no_wrap": True},
             "Job ID": {"ratio": 2, "no_wrap": True},

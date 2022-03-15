@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import dataclasses
-from email.policy import default
 from functools import cached_property
 from abc import ABC
 from glob import glob
+from importlib.metadata import metadata
 import re
 import asyncio
 import shutil
 from copy import copy
-from types import new_class
 from typing import (
     Any,
     ClassVar,
@@ -23,8 +22,8 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    cast,
 )
-
 
 SACCTMGR_PATH = shutil.which("sacctmgr")
 
@@ -114,35 +113,51 @@ class MultipleObjectReturned(SlurmObjectException):
     pass
 
 
-FieldType = TypeVar("FieldType")
-
-
-class ReadOnlyField(Generic[FieldType]):
-    """This field will be ignored when writing the object to sacctmgr"""
-
-
-class SyntheticField(ReadOnlyField[FieldType]):
-    """
-    This field will be ignored when querying sacctmgr and when writing back objects.
-    It is synthesized, probably based on other attributes of the object during
-    object instantiation
-    """
-
-
-class PrimaryKeyField(ReadOnlyField[FieldType]):
-    """
-    this field is used to identify the object when building a query to sacctmgr
-    """
-
-
-class WriteOnlyField(Generic[FieldType]):
-    """
-    some fields in sacctmgr are write only, e.g. NewUsername
-    """
-
-
 ObjectType = TypeVar("ObjectType", bound="SlurmObject")
 WritableObjectType = TypeVar("WritableObjectType", bound="WritableSlurmObject")
+
+READONLY = {"readonly": True}
+WRITEONLY = {"writeonly": True}
+SYNTHETIC = {"synthetic": True}
+PRIMARYKEY = {"primarykey": True}
+
+
+def field(
+    *,
+    default=dataclasses.MISSING,
+    default_factory=dataclasses.MISSING,
+    init=True,
+    repr=True,
+    hash=None,
+    compare=True,
+    metadata=None,
+    kw_only=dataclasses.MISSING,
+    read_only=False,
+    synthetic=False,
+    write_only=False,
+    primary_key=False,
+):
+    if metadata is None:
+        metadata = {}
+    if read_only:
+        metadata |= READONLY
+    if synthetic:
+        metadata |= SYNTHETIC | READONLY
+    if primary_key:
+        metadata |= PRIMARYKEY | READONLY
+    if write_only:
+        metadata |= WRITEONLY
+
+    return dataclasses.field(
+        default=default,
+        default_factory=default_factory,
+        init=init,
+        repr=repr,
+        hash=hash,
+        compare=compare,
+        metadata=metadata,
+        kw_only=kw_only,
+    )
 
 
 class SlurmObject(ABC, Generic[ObjectType]):
@@ -155,21 +170,18 @@ class SlurmObject(ABC, Generic[ObjectType]):
     def __init_subclass__(cls) -> None:
         super().__init_subclass__()
         cls = dataclasses.dataclass(cls)
-        cls._primary_key_fields = cls._collect_all_fields_of_type(PrimaryKeyField)
-        cls._read_only_fields = cls._collect_all_fields_of_type(ReadOnlyField)
-        cls._write_only_fields = cls._collect_all_fields_of_type(WriteOnlyField)
-        cls._synthetic_fields = cls._collect_all_fields_of_type(SyntheticField)
+        cls._primary_key_fields = cls._collect_all_fields_of_type(PRIMARYKEY)
+        cls._read_only_fields = cls._collect_all_fields_of_type(READONLY)
+        cls._write_only_fields = cls._collect_all_fields_of_type(WRITEONLY)
+        cls._synthetic_fields = cls._collect_all_fields_of_type(SYNTHETIC)
 
     @classmethod
-    def _collect_all_fields_of_type(cls, field_type: Type):
-        field_types = [field_type, *field_type.__subclasses__()]
-        field_type_names = [cls.__name__ for cls in field_types]
+    def _collect_all_fields_of_type(cls, field_type: Dict[str, bool]):
+        type_key = list(field_type.keys())[0]
         return [
             field.name
             for field in dataclasses.fields(cls)
-            if any(
-                field_type_name in field.type for field_type_name in field_type_names
-            )
+            if field.metadata is not None and field.metadata.get(type_key, False)
         ]
 
     def __setattr__(self, __name: str, __value: Any) -> None:
@@ -184,7 +196,7 @@ class SlurmObject(ABC, Generic[ObjectType]):
         verb: str,
         *arguments: str,
         error_ok=False,
-    ) -> Tuple[int, str]:
+    ) -> Tuple[int | None, str]:
         if SACCTMGR_PATH is None:
             raise ImportError("sacctmgr could not be found in path.")
 
@@ -269,7 +281,7 @@ class SlurmObject(ABC, Generic[ObjectType]):
         return update_fields, filter_fields
 
     @classmethod
-    async def filter(cls, **filters: str) -> Sequence[ObjectType]:
+    async def filter(cls: Type[ObjectType], **filters: str) -> Sequence[ObjectType]:
         object_fields = [
             snake_to_camel_case(field.name)
             for field in dataclasses.fields(cls)
@@ -400,35 +412,33 @@ class WritableSlurmObject(SlurmObject[WritableObjectType]):
         return len(updated_keys) == 1
 
 
-class Association(SlurmObject[ObjectType]):
+AssociationType = TypeVar("AssociationType", bound="Association")
+
+
+class Association(SlurmObject[AssociationType]):
     query_options = ("tree",)
 
-    id: ReadOnlyField[str] = dataclasses.field()
-    parent_id: ReadOnlyField[str] = dataclasses.field(repr=False)
-    parent_name: ReadOnlyField[str] = dataclasses.field(repr=False)
-    parent: SyntheticField[Association | None]
-    nesting_level: SyntheticField[int]
-    cluster: ReadOnlyField[str]
-    account: ReadOnlyField[str]
-    user: ReadOnlyField[str | None]
-    partition: str
-    children: SyntheticField[Sequence[Association]] = dataclasses.field(
-        default_factory=lambda: list()
-    )
-
     _: dataclasses.KW_ONLY
-    grp_tres_mins: Optional[str] = dataclasses.field(repr=False, default=None)
-    grp_tres_run_mins: Optional[str] = dataclasses.field(repr=False, default=None)
-    grp_tres: Optional[str] = dataclasses.field(repr=False, default=None)
-    grp_jobs: Optional[str] = dataclasses.field(repr=False, default=None)
-    grp_submit_jobs: Optional[str] = dataclasses.field(repr=False, default=None)
-    grp_wall: Optional[str] = dataclasses.field(repr=False, default=None)
-    max_tres_mins_per_job: Optional[str] = dataclasses.field(repr=False, default=None)
-    max_tres_per_job: Optional[str] = dataclasses.field(repr=False, default=None)
-    max_tres_per_node: Optional[str] = dataclasses.field(repr=False, default=None)
-    max_wall_duration_per_job: Optional[str] = dataclasses.field(
-        repr=False, default=None
-    )
+    id: str = field(read_only=True)
+    parent_id: str = field(repr=False, read_only=True)
+    parent_name: str = field(repr=False, read_only=True)
+    parent_object: Association | None = field(synthetic=True)
+    nesting_level: int = field(repr=False, synthetic=True)
+    cluster: str = field(repr=False, read_only=True)
+    account: str = field(read_only=True)
+    user: str | None = field(read_only=True)
+    partition: str = field(repr=False)
+    children: List[Association] = field(default_factory=lambda: list(), synthetic=True)
+    grp_tres_mins: str | None = dataclasses.field(repr=False, default=None)
+    grp_tres_run_mins: str | None = dataclasses.field(repr=False, default=None)
+    grp_tres: str | None = dataclasses.field(repr=False, default=None)
+    grp_jobs: str | None = dataclasses.field(repr=False, default=None)
+    grp_submit_jobs: str | None = dataclasses.field(repr=False, default=None)
+    grp_wall: str | None = dataclasses.field(repr=False, default=None)
+    max_tres_mins_per_job: str | None = dataclasses.field(repr=False, default=None)
+    max_tres_per_job: str | None = dataclasses.field(repr=False, default=None)
+    max_tres_per_node: str | None = dataclasses.field(repr=False, default=None)
+    max_wall_duration_per_job: str | None = dataclasses.field(repr=False, default=None)
     fairshare: Optional[str] = dataclasses.field(repr=False, default=None)
     max_jobs: Optional[str] = dataclasses.field(repr=False, default=None)
     max_submit_jobs: Optional[str] = dataclasses.field(repr=False, default=None)
@@ -436,9 +446,9 @@ class Association(SlurmObject[ObjectType]):
 
     @classmethod
     def _response_to_instances(
-        cls: Type[ObjectType], response: Sequence[Dict[str, str]]
-    ) -> Sequence[Union[User, Account]]:
-        instances: list[ObjectType] = []
+        cls, response: Sequence[Dict[str, str]]
+    ) -> Sequence[AssociationType]:
+        instances: list[AssociationType] = []
         # thanks to the "tree" query option we get the results in order and the
         # account names are prefixed with spaces to represent the nesting level
         # so we can rebuild the hierarchy tree keeping track of the information
@@ -456,12 +466,13 @@ class Association(SlurmObject[ObjectType]):
             # create the instance based on whether a username is given or not
             instance_type = Account if attributes["user"] is None else User
             account = account_response.strip()
-            instance = instance_type(
-                parent=parent,
+            instance = instance_type(  # type:ignore
+                parent_object=parent,
                 account=account,
                 nesting_level=nesting_level,
                 **attributes,
             )
+            instance = cast(AssociationType, instance)
 
             # build the tree
             if parent is not None:
@@ -489,14 +500,13 @@ class Association(SlurmObject[ObjectType]):
 
 class Account(Association["Account"], WritableSlurmObject["Account"]):
     query_options = ("withassoc",)
-    account: PrimaryKeyField[str]
-    parent: SyntheticField[str]
+    account: str = field(primary_key=True)
+    parent: str = field(write_only=True, default=None)
 
     async def set_parent(self, new_paernt):
         filters = {"Account": self.account}
         updates = {"parent": new_paernt}
         await self._scattmgr_write("modify", updates, filters)
-        del self.parent
         self.parent = new_paernt
         await self.refresh_from_db()
 
@@ -507,9 +517,9 @@ class Account(Association["Account"], WritableSlurmObject["Account"]):
 class User(Association["User"], WritableSlurmObject["User"]):
     query_options = ("withassoc",)
 
-    user: PrimaryKeyField[str]
-    account: PrimaryKeyField[str]
-    default_account: WriteOnlyField[str | None] = None
+    user: str = field(primary_key=True)
+    account: str = field(primary_key=True)
+    default_account: str | None = dataclasses.field(default=None, metadata=WRITEONLY)
 
     async def set_account(self, new_account: Account):
         old_account = self
@@ -548,7 +558,7 @@ class User(Association["User"], WritableSlurmObject["User"]):
 
 
 class QOS(SlurmObject["QOS"]):
-    user: PrimaryKeyField[str]
+    user: str = field(primary_key=True)
     default_account: str
     grp_tres_mins: str
     grp_tres_run_mins: str
