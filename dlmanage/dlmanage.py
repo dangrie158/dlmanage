@@ -165,5 +165,5 @@ class SlurmControl(App):
         await self.set_focus(self.main_content)
 
 
-if __name__ == "__main__":
+def main():
     SlurmControl.run(title="Slurm Control")

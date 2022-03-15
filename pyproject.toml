@@ -1,11 +1,11 @@
 [tool.poetry]
-name = "manage-cluster"
+name = "dlmanage"
 version = "0.1.0"
 description = ""
 authors = ["Griesshaber Daniel <griesshaber@hdm-stuttgart.de>"]
 
 [tool.poetry.scripts]
-dlmanage = "dlmanage:main"
+dlmanage = "dlmanage.dlmanage:main"
 
 [tool.poetry.dependencies]
 python = "^3.10"
@@ -14,7 +14,7 @@ rich = "^11.2.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "^5.2"
-mypy = "^0.940"
+mypy = "^0.941"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
