@@ -6,29 +6,29 @@ from textual.widgets import Header, ScrollView, TreeControl, TreeClick
 from textual.widget import Widget
 from textual import actions
 
-from widgets import (
+from dlmanage.widgets import (
     Footer,
     InteractiveTableModel,
     InteractiveTable,
     TableTheme,
 )
 
-from models import AssociationListModel, JobListModel
-from widgets.footer import ErrorDismissed, PromptResponse
+from dlmanage.models import AssociationListModel, JobListModel, NodeListModel
+from dlmanage.widgets.footer import ErrorDismissed, PromptResponse
 
 
 class AppTheme(TableTheme):
-    # main colors: #007AD0, #17825D, #CD652A
+    # main colors: #007AD0, #729900, #CD652A
 
     cell = Style(color="bright_white")
     header = Style(color="#CD652A")
     text_cell = Style(color="#007AD0")
-    int_cell = Style(color="#17825D")
+    int_cell = Style(color="#729900")
     hovered_cell = Style(bold=True, underline=True)
     selected_row = Style(bgcolor="gray19")
     choice_cell = Style(color="#007AD0")
     focused_cell = Style(
-        color="#17825D", bgcolor="gray30", bold=True, underline=True, overline=True
+        color="#729900", bgcolor="gray30", bold=True, underline=True, overline=True
     )
     editing_cell = Style(color="green", bgcolor="gray30", bold=True, underline=False)
     focused_border_style = NULL_STYLE
@@ -43,7 +43,7 @@ class SlurmControl(App):
 
     async def on_load(self, event: events.Load) -> None:
         await self.bind("q", "quit", "Quit")
-        await self.bind("ctrl+i", "switch_focus", "Switch Focus", key_display="TAB")
+        await self.bind("ctrl+i", "switch_focus", "Switch Focus", show=False)
         await self.bind("enter", "edit", "Edit")
 
     async def on_mount(self, event: events.Mount) -> None:
@@ -58,11 +58,13 @@ class SlurmControl(App):
         self.main_content_container = ScrollView(object_list)
 
         self.sidebar_content = model_tree = TreeControl("Models", None)
+        self.sidebar_content._tree.hide_root = True
         self.sidebar_content.border = "round"
         self.sidebar_content.can_focus = True
 
         await model_tree.root.add(AssociationListModel.title, AssociationListModel)
         await model_tree.root.add("Jobs", JobListModel)
+        await model_tree.root.add("Nodes", NodeListModel)
         await model_tree.root.expand()
 
         await self.view.dock(self.header, edge="top")
@@ -100,6 +102,7 @@ class SlurmControl(App):
         self.model = model
         # register the new model bindings
         if model is not None:
+            self.header.sub_title = model.title
             self._action_targets.add("model")
             for binding in model.keys.values():
                 await self.bind(

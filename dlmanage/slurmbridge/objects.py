@@ -2,20 +2,26 @@ from __future__ import annotations
 from copy import copy
 
 import dataclasses
+from datetime import datetime, timedelta
 from functools import cached_property
-from typing import Dict, List, Optional, Sequence, TypeVar, cast
-from slurmbridge.sacctmgr import (
-    SlurmAccountManagerError,
-    field,
-    SlurmObject,
-    WritableSlurmObject,
+from typing import Dict, List, Optional, Sequence, Tuple, TypeVar, cast
+from dlmanage.slurmbridge.common import (
+    get_gres_value,
+    update_gres_value,
+    find_home_directory,
 )
-from slurmbridge.common import get_gres_value, update_gres_value, find_home_directory
+from dlmanage.slurmbridge.cliobject import field
+from dlmanage.slurmbridge.sacctmgr import (
+    SlurmAccountManagerError,
+    SlurmAccountManagerObject,
+    WritableSlurmAccountManagerObject,
+)
+from dlmanage.slurmbridge.scontrol import SlurmControlObject
 
 AssociationType = TypeVar("AssociationType", bound="Association")
 
 
-class Association(SlurmObject[AssociationType]):
+class Association(SlurmAccountManagerObject[AssociationType]):
     query_options = ("tree",)
 
     _: dataclasses.KW_ONLY
@@ -98,12 +104,12 @@ class Association(SlurmObject[AssociationType]):
         self.grp_tres = update_gres_value(self.grp_tres, "cpu", new_val)
 
 
-class Account(Association["Account"], WritableSlurmObject["Account"]):
+class Account(Association["Account"], WritableSlurmAccountManagerObject["Account"]):
     query_options = ("withassoc",)
     account: str = field(primary_key=True)
     parent: str = field(write_only=True, default=None)
 
-    async def set_parent(self, new_paernt):
+    async def set_parent(self, new_paernt: str):
         filters = {"Account": self.account}
         updates = {"parent": new_paernt}
         await self._scattmgr_write("modify", updates, filters)
@@ -114,7 +120,7 @@ class Account(Association["Account"], WritableSlurmObject["Account"]):
         return f"Account {self.account}"
 
 
-class User(Association["User"], WritableSlurmObject["User"]):
+class User(Association["User"], WritableSlurmAccountManagerObject["User"]):
     query_options = ("withassoc",)
 
     user: str = field(primary_key=True)
@@ -157,7 +163,7 @@ class User(Association["User"], WritableSlurmObject["User"]):
         return f"User {self.user} in {self.account}"
 
 
-class QOS(SlurmObject["QOS"]):
+class QOS(SlurmAccountManagerObject["QOS"]):
     user: str = field(primary_key=True)
     default_account: str
     grp_tres_mins: str
@@ -183,8 +189,9 @@ class QOS(SlurmObject["QOS"]):
 
 
 @dataclasses.dataclass
-class Job:
-    job_id: str
+class Job(SlurmControlObject["Job"]):
+    job_id: str = field(primary_key=True)
+    _: dataclasses.KW_ONLY
     job_name: str
     job_state: str
     run_time: str
@@ -192,14 +199,29 @@ class Job:
     tres: str
     user_id: str
     group_id: str
+    account: str
     array_task_id: Optional[str] = None
     reason: Optional[str] = None
 
+    @cached_property
+    def username(self) -> str:
+        # the username returned by scontrol has the user_id in parentesis (e.g. "griesshaber(1234)")
+        user_name, *_ = self.user_id.split("(")
+        return user_name
+
+    @cached_property
+    def job_id_with_array(self):
+        job_id = self.job_id
+        if self.array_task_id is not None:
+            job_id += f"[{self.array_task_id}]"
+        return job_id
+
     async def get_user(self) -> User:
-        return await User.get(user=self.user_id, account=self.group_id)
+        user_name = self.username
+        return await User.get(user=user_name, account=self.account)
 
     async def get_account(self) -> Account:
-        return await Account.get(account=self.group_id)
+        return await Account.get(account=self.account)
 
     @property
     def cpus(self) -> str | None:
@@ -213,53 +235,60 @@ class Job:
     def gpus(self) -> str | None:
         return get_gres_value(self.tres, "gres/gpu")
 
-    @classmethod
-    def all(cls) -> Sequence[Job]:
-        return [
-            Job(
-                "37780",
-                "fixed-mixed-loss-05-metatrain",
-                "RUNNING",
-                "0-23:20:15",
-                "4-00:00:00",
-                "cpu=30,mem=128G,node=1,billing=4",
-                "griesshaber",
-                "employee",
-            ),
-            Job(
-                "37780",
-                "fixed-mixed-loss-05-finetune-16",
-                "PENDING",
-                "0-00:00:00",
-                "4-00:00:00",
-                "cpu=4,mem=16G,node=1,billing=4,gres/gpu=1",
-                "griesshaber",
-                "employee",
-                "0-169",
-                "Dependency",
-            ),
-            Job(
-                "37780",
-                "fixed-mixed-loss-05-finetune-8",
-                "PENDING",
-                "0-00:00:00",
-                "4-00:00:00",
-                "cpu=4,mem=16G,node=1,billing=4,gres/gpu=1",
-                "griesshaber",
-                "employee",
-                "0-169",
-                "Dependency",
-            ),
-            Job(
-                "37780",
-                "fixed-mixed-loss-05-finetune-4",
-                "PENDING",
-                "0-00:00:00",
-                "4-00:00:00",
-                "cpu=4,mem=16G,node=1,billing=4,gres/gpu=1",
-                "griesshaber",
-                "employee",
-                "0-169",
-                "Dependency",
-            ),
-        ]
+
+@dataclasses.dataclass
+class Node(SlurmControlObject["Node"]):
+    node_name: str = field(primary_key=True)
+    _: dataclasses.KW_ONLY
+    cpualloc: str
+    cputot: str
+    cpuload: str | None
+    gres: str | None
+    gres_used: str | None
+    boot_time: str | None
+    state: str
+
+    @cached_property
+    def uptime(self) -> timedelta | None:
+        if self.boot_time is None:
+            return None
+
+        boot_time: datetime
+        try:
+            boot_time = datetime.fromisoformat(self.boot_time)
+        except ValueError:
+            return None
+
+        uptime = datetime.now() - boot_time
+        # remove the microsecond resolution
+        uptime = timedelta(uptime.days, uptime.seconds)
+        return uptime
+
+    @cached_property
+    def cpu_allocation(self) -> Tuple[str, str]:
+        return self.cpualloc, self.cputot
+
+    @cached_property
+    def gpu_allocation(self) -> Tuple[str, str]:
+        """
+        gres:'gpu:turing:4'
+        gres_used:'gpu:turing:0(IDX:N/A)'
+        """
+        if self.gres is None or self.gres_used is None:
+            return ("n", "a")
+
+        # example gres string: "gpu:turing:4,gpu:ampere:4"
+        gres_entries = self.gres.split(",")
+        gres_used_entries = self.gres_used.split(",")
+
+        avaliable_gpus = sum(int(entry.split(":")[-1]) for entry in gres_entries)
+        # example gres_used string: "gpu:turing:0(IDX:N/A)"
+        used_gpus = sum(
+            int(entry.split("(")[0].split(":")[-1]) for entry in gres_used_entries
+        )
+        return str(used_gpus), str(avaliable_gpus)
+
+    @cached_property
+    def allocated_gpus(self) -> Sequence[str]:
+        # example gres_used string: "gpu:turing:0(IDX:N/A)"
+        return []

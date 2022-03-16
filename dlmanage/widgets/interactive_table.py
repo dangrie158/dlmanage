@@ -4,6 +4,7 @@ from contextlib import suppress
 import threading
 from typing import (
     Any,
+    ClassVar,
     Dict,
     Iterable,
     Mapping,
@@ -24,6 +25,8 @@ from rich.padding import PaddingDimensions
 from rich.console import RenderableType
 from rich.status import Status
 from rich.align import Align
+from rich.progress_bar import ProgressBar
+from rich.columns import Columns
 
 from textual import events
 from textual.app import App
@@ -113,6 +116,33 @@ class TableCell(Widget):
 
     def hover_leave(self):
         self.is_hovered = False
+
+
+class ProgressTableCell(TableCell):
+    def __init__(
+        self,
+        position: TablePosition,
+        text: Optional[str] = None,
+        *,
+        fill_percent: float = 0,
+        style: Optional[Style] = None,
+        theme: Optional[TableTheme] = None,
+        placeholder: str = "<undefined>",
+        hint: Optional[str] = None,
+    ):
+        self.fill_percent = fill_percent
+        super().__init__(
+            position, text, style=style, theme=theme, placeholder=placeholder, hint=hint
+        )
+
+    def render(self) -> RenderableType:
+        layout = Columns()
+        text_widget = super().render()
+        progress_bar_widget = ProgressBar(total=100, completed=self.fill_percent)
+        layout.add_renderable(progress_bar_widget)
+        layout.add_renderable(Align.right(text_widget))
+
+        return layout
 
 
 class EditableTableCell(TableCell):
@@ -404,7 +434,7 @@ class CellFinishedEditing(Message):
 
 
 class InteractiveTableModel(ABC, Bindings):
-    title: str
+    title: ClassVar[str]
 
     def __init__(self, app: App, table_widget: InteractiveTable) -> None:
         super().__init__()
@@ -422,6 +452,14 @@ class InteractiveTableModel(ABC, Bindings):
     @abstractmethod
     def get_num_rows(self) -> int:
         ...
+
+    async def refresh(self):
+        await self.load_data()
+        await self.table_widget.refresh_data_from_model()
+        self.table_widget.refresh()
+        # we need to manually trigger the select_position watcher to reforcus the newly created cell
+        old_position = self.table_widget.selection_position
+        self.table_widget.watch_selection_position(None, old_position)
 
     @abstractmethod
     async def on_cell_update(self, position: TablePosition, new_value: str) -> None:

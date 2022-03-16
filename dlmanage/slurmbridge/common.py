@@ -11,22 +11,6 @@ def snake_to_camel_case(input: str) -> str:
     return "".join([part.title() for part in input.split("_")])
 
 
-class SlurmObjectException(Exception):
-    def __init__(self, Object_class):
-        self.Object_class = Object_class
-
-    def __str__(self) -> str:
-        return f"{self.Object_class.__name__} - {self.__class__.__name__}"
-
-
-class NotFound(SlurmObjectException):
-    pass
-
-
-class MultipleObjectReturned(SlurmObjectException):
-    pass
-
-
 def get_gres_value(haystack: str, needle: str) -> Optional[str]:
     if haystack is None:
         return None

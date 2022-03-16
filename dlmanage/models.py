@@ -1,27 +1,31 @@
-from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple, Type
+from collections import defaultdict
+from contextlib import suppress
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple, Type
 from io import StringIO
 
 from rich.tree import Tree
 from rich.console import Console
 from textual.app import App
 
-from widgets.interactive_table import (
+from dlmanage.widgets.interactive_table import (
     EditableChoiceTableCell,
     EditableIntTableCell,
     EditableTableCell,
     InteractiveTableModel,
     InteractiveTable,
+    ProgressTableCell,
     TableCell,
     TablePosition,
 )
-from slurmbridge.objects import (
+from dlmanage.slurmbridge import (
     Job,
     SlurmAccountManagerError,
     User,
     Account,
     Association,
+    Node,
+    SlurmObjectException,
 )
-from slurmbridge.common import SlurmObjectException
 
 
 def get_association_with_lowest_grp_tres(
@@ -84,8 +88,28 @@ def build_account_tree(root_node: Association) -> Sequence[str]:
     return tree_buffer.getvalue().splitlines()
 
 
+def build_job_tree(jobs: Sequence[Job], attribute_name: str):
+    jobs_by_attribute: defaultdict[str, List[Job]] = defaultdict(list)
+    joblist_for_tree: Sequence[Job, None] = []
+    tree = Tree("All Jobs", hide_root=True)
+    for job in jobs:
+        jobs_by_attribute[getattr(job, attribute_name)].append(job)
+
+    for node_name, joblist in jobs_by_attribute.items():
+        node = tree.add(node_name)
+        joblist_for_tree.append(None)
+        for job in joblist:
+            joblist_for_tree.append(job)
+            node.add(job.job_id_with_array)
+
+    tree_buffer = StringIO()
+    console = Console(file=tree_buffer, width=500)
+    console.print(tree)
+    return tree_buffer.getvalue().splitlines(), joblist_for_tree
+
+
 class AssociationListModel(InteractiveTableModel):
-    title = "Users and Groups"
+    title = "Users and Accounts"
 
     def __init__(self, app: App, table_widget: InteractiveTable):
         super().__init__(app, table_widget)
@@ -98,9 +122,13 @@ class AssociationListModel(InteractiveTableModel):
             "Home Directory": {"justify": "right", "ratio": 2, "no_wrap": True},
         }
 
+        self.bind("f5", "refresh", "Refresh")
         self.bind("ctrl+a", "add_account", "Add a new Account")
         self.bind("ctrl+u", "add_user", "Add a new User")
         self.bind("ctrl+d", "delete_entry", "Delete Entry")
+
+    async def action_refresh(self):
+        await self.refresh()
 
     async def action_add_account(self):
         current_selection = self.table_widget.selection_position or TablePosition("", 0)
@@ -113,8 +141,16 @@ class AssociationListModel(InteractiveTableModel):
         self, column: str, row: int, accountname: str, confirmed: bool
     ):
         if confirmed:
+            # try to find the next account up the hierarchy from the selected
+            # row "upwards"
+            parent = self._data[row]
+            while not isinstance(parent, Account):
+                parent = parent.parent_object
+            parent_name = parent.account or "root"
             try:
-                await Account.create(account=accountname)
+                new_account = await Account.create(account=accountname)
+                with suppress(SlurmObjectException):
+                    await new_account.set_parent(parent_name)
                 await self.refresh()
                 next_row = await self.get_next_row_matching(
                     0, accountname, ("account",)
@@ -136,7 +172,13 @@ class AssociationListModel(InteractiveTableModel):
     ):
         if confirmed:
             try:
-                await User.create(user=username, account="root")
+                # try to find the next account up the hierarchy from the selected
+                # row "upwards"
+                initial_account = self._data[row]
+                while not isinstance(initial_account, Account):
+                    initial_account = initial_account.parent_object
+                initial_account_name = initial_account.account or "root"
+                await User.create(user=username, account=initial_account_name)
                 await self.refresh()
                 next_row = await self.get_next_row_matching(0, username, ("user",))
                 if next_row:
@@ -175,11 +217,6 @@ class AssociationListModel(InteractiveTableModel):
         self._data = await Association.all()
         self._available_accounts = await Account.all()
         self.account_tree = build_account_tree(self._data[0])
-
-    async def refresh(self):
-        await self.load_data()
-        await self.table_widget.refresh_data_from_model()
-        self.table_widget.refresh()
 
     def get_columns(self) -> Iterable[str]:
         return self._columns.keys()
@@ -313,45 +350,55 @@ class AssociationListModel(InteractiveTableModel):
 
 
 class JobListModel(InteractiveTableModel):
+    title = "Jobs"
+
     def __init__(self, app: App, table_widget: InteractiveTable):
         super().__init__(app, table_widget)
         self._columns: Mapping[str, Mapping[str, Any]] = {
-            "user": {"ratio": 2, "no_wrap": True},
-            "Job ID": {"ratio": 2, "no_wrap": True},
-            "CPUs": {"justify": "center", "ratio": 1, "no_wrap": True},
-            "GPUs": {"justify": "center", "ratio": 1, "no_wrap": True},
-            "Memory": {"justify": "center", "ratio": 1, "no_wrap": True},
+            "user": {"ratio": 1, "no_wrap": True},
+            "Job ID": {"justify": "left", "ratio": 1, "no_wrap": True},
+            "Job Name": {"justify": "center", "ratio": 3, "no_wrap": True},
+            "CPUs": {"justify": "right", "ratio": 1, "no_wrap": True},
+            "GPUs": {"justify": "right", "ratio": 1, "no_wrap": True},
+            "Memory": {"justify": "right", "ratio": 1, "no_wrap": True},
             "Timelimit": {"justify": "right", "ratio": 2, "no_wrap": True},
             "Runtime": {"justify": "right", "ratio": 2, "no_wrap": True},
         }
 
+        self.bind("f5", "refresh", "Refresh")
         self.bind("ctrl+x", "cancel_job", "Cancel Job")
         self.bind("ctrl+h", "hold_job", "Put on Hold")
         self.bind("ctrl+r", "unhold_job", "Remove Hold")
 
-    async def load_data(self):
+    async def action_refresh(self):
+        await self.refresh()
 
-        self._data = Job.all()
+    async def load_data(self):
+        self._data = await Job.all()
+        self._job_tree, self._tree_list = build_job_tree(self._data, "username")
 
     def get_columns(self) -> Iterable[str]:
         return self._columns.keys()
 
     def get_num_rows(self) -> int:
-        return len(self._data)
+        return len(self._job_tree)
 
     def get_column_kwargs(self, column_name: str) -> Mapping[str, Any]:
         return self._columns.get(column_name, {})
 
     async def get_cell(self, position: TablePosition) -> str | None:
-        row_object = self._data[position.row]
+        tree_node = self._job_tree[position.row]
+        row_object = self._tree_list[position.row]
+        if row_object is None and position.column != "Job ID":
+            return ""
+
         match (position.column):
             case "user":
-                return row_object.user_id
+                return row_object.username
             case "Job ID":
-                cell_text = row_object.job_id
-                if row_object.array_task_id is not None:
-                    cell_text += f"[{row_object.array_task_id}]"
-                return cell_text
+                return tree_node
+            case "Job Name":
+                return row_object.job_name
             case "CPUs":
                 return row_object.cpus
             case "GPUs":
@@ -373,13 +420,95 @@ class JobListModel(InteractiveTableModel):
     async def get_cell_class(
         self, position: TablePosition
     ) -> Tuple[Type[TableCell], Dict[str, Any]]:
+        row_object = self._tree_list[position.row]
+        if row_object is None:
+            return TableCell, {}
+
         match (position.column):
-            case "user" | "Job ID" | "Runtime":
+            case "user" | "Job ID" | "Job Name" | "Runtime":
                 return TableCell, {}
             case "CPUs" | "GPUs":
                 return EditableIntTableCell, {"min_value": 0}
             case "Memory" | "Timelimit":
                 return EditableTableCell, {}
+            case unknown_name:
+                raise AttributeError(f"Unknown column: {unknown_name}")
+
+    async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
+        pass
+
+
+class NodeListModel(InteractiveTableModel):
+    title = "Nodes"
+
+    def __init__(self, app: App, table_widget: InteractiveTable):
+        super().__init__(app, table_widget)
+        self._columns: Mapping[str, Mapping[str, Any]] = {
+            "Node Name": {"ratio": 1, "no_wrap": True},
+            "State": {"ratio": 1, "no_wrap": True},
+            "CPU Load": {"justify": "center", "ratio": 2, "no_wrap": True},
+            "GPU Load": {"justify": "center", "ratio": 2, "no_wrap": True},
+            "Uptime": {"justify": "right", "ratio": 1, "no_wrap": True},
+        }
+        self.bind("f5", "refresh", "Refresh")
+
+    async def action_refresh(self):
+        await self.refresh()
+
+    async def load_data(self):
+        self._data = await Node.all()
+
+    def get_columns(self) -> Iterable[str]:
+        return self._columns.keys()
+
+    def get_num_rows(self) -> int:
+        return len(self._data)
+
+    def get_column_kwargs(self, column_name: str) -> Mapping[str, Any]:
+        return self._columns.get(column_name, {})
+
+    async def get_cell(self, position: TablePosition) -> str | None:
+        row_object = self._data[position.row]
+        match (position.column):
+            case "Node Name":
+                return row_object.node_name
+            case "State":
+                return row_object.state
+            case "CPU Load":
+                allocated, total = row_object.cpu_allocation
+                return f"{allocated} / {total}"
+            case "GPU Load":
+                allocated, total = row_object.gpu_allocation
+                return f"{allocated} / {total}"
+            case "Uptime":
+                return str(row_object.uptime) if row_object.uptime else None
+            case unknown_name:
+                raise AttributeError(f"Unknown column: {unknown_name}")
+
+    async def get_cell_class(
+        self, position: TablePosition
+    ) -> Tuple[Type[TableCell], Dict[str, Any]]:
+        row_object = self._data[position.row]
+        current_load: float = 0
+        match (position.column):
+            case "Node Name" | "Uptime":
+                return TableCell, {}
+            case "CPU Load":
+                try:
+                    allocated, total = row_object.cpu_allocation
+                    current_load = (int(allocated) / int(total)) * 100
+                except ValueError:
+                    pass
+                return ProgressTableCell, {"fill_percent": current_load}
+            case "GPU Load":
+                try:
+                    allocated, total = row_object.gpu_allocation
+                    current_load = (int(allocated) / int(total)) * 100
+                except ValueError:
+                    pass
+                return ProgressTableCell, {"fill_percent": current_load}
+            case "State":
+                return EditableChoiceTableCell, {"choices": ["Up", "Reboot"]}
             case unknown_name:
                 raise AttributeError(f"Unknown column: {unknown_name}")
 

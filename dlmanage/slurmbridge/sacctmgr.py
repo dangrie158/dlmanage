@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 import dataclasses
-from abc import ABC
 import asyncio
 import shutil
 from typing import (
-    Any,
     ClassVar,
     Dict,
-    Generic,
-    List,
     Mapping,
     Optional,
     Sequence,
@@ -17,98 +13,28 @@ from typing import (
     Type,
     TypeVar,
 )
+from dlmanage.slurmbridge.cliobject import SlurmCLIObject, SlurmObjectException
 
-from slurmbridge.common import (
-    NotFound,
+from dlmanage.slurmbridge.common import (
     camel_to_snake_case,
     snake_to_camel_case,
-    MultipleObjectReturned,
 )
 
 SACCTMGR_PATH = shutil.which("sacctmgr")
 
 
-class SlurmAccountManagerError(Exception):
+class SlurmAccountManagerError(SlurmObjectException):
     def __str__(self) -> str:
-        return f"{self.args[0]}"
+        return f"{self.args[1]}"
 
 
-ObjectType = TypeVar("ObjectType", bound="SlurmObject")
-WritableObjectType = TypeVar("WritableObjectType", bound="WritableSlurmObject")
-
-READONLY = {"readonly": True}
-WRITEONLY = {"writeonly": True}
-SYNTHETIC = {"synthetic": True}
-PRIMARYKEY = {"primarykey": True}
+AccountManagerObjectType = TypeVar(
+    "AccountManagerObjectType", bound="SlurmAccountManagerObject"
+)
 
 
-def field(
-    *,
-    default=dataclasses.MISSING,
-    default_factory=dataclasses.MISSING,
-    init=True,
-    repr=True,
-    hash=None,
-    compare=True,
-    metadata=None,
-    kw_only=dataclasses.MISSING,
-    read_only=False,
-    synthetic=False,
-    write_only=False,
-    primary_key=False,
-):
-    if metadata is None:
-        metadata = {}
-    if read_only:
-        metadata |= READONLY
-    if synthetic:
-        metadata |= SYNTHETIC | READONLY
-    if primary_key:
-        metadata |= PRIMARYKEY | READONLY
-    if write_only:
-        metadata |= WRITEONLY
-
-    return dataclasses.field(
-        default=default,
-        default_factory=default_factory,
-        init=init,
-        repr=repr,
-        hash=hash,
-        compare=compare,
-        metadata=metadata,
-        kw_only=kw_only,
-    )
-
-
-class SlurmObject(ABC, Generic[ObjectType]):
+class SlurmAccountManagerObject(SlurmCLIObject[AccountManagerObjectType]):
     query_options: ClassVar[Sequence[str]] = tuple()
-    _primary_key_fields: List[str]
-    _read_only_fields: List[str]
-    _write_only_fields: List[str]
-    _synthetic_fields: List[str]
-
-    def __init_subclass__(cls) -> None:
-        super().__init_subclass__()
-        cls = dataclasses.dataclass(cls)
-        cls._primary_key_fields = cls._collect_all_fields_of_type(PRIMARYKEY)
-        cls._read_only_fields = cls._collect_all_fields_of_type(READONLY)
-        cls._write_only_fields = cls._collect_all_fields_of_type(WRITEONLY)
-        cls._synthetic_fields = cls._collect_all_fields_of_type(SYNTHETIC)
-
-    @classmethod
-    def _collect_all_fields_of_type(cls, field_type: Dict[str, bool]):
-        type_key = list(field_type.keys())[0]
-        return [
-            field.name
-            for field in dataclasses.fields(cls)
-            if field.metadata is not None and field.metadata.get(type_key, False)
-        ]
-
-    def __setattr__(self, __name: str, __value: Any) -> None:
-        # make writing to read-only fields a runtime error
-        if hasattr(self, __name) and __name in self._read_only_fields:
-            raise AttributeError(f"{__name} is a read-only field")
-        return super().__setattr__(__name, __value)
 
     @classmethod
     async def _run_scattmgr_command(
@@ -134,7 +60,7 @@ class SlurmObject(ABC, Generic[ObjectType]):
         process_output = (stderr if len(stderr) > 0 else stdout).decode("ascii")
 
         if not error_ok and process.returncode != 0:
-            raise SlurmAccountManagerError(process_output)
+            raise SlurmAccountManagerError(cls, process_output)
 
         return process.returncode, process_output
 
@@ -162,7 +88,7 @@ class SlurmObject(ABC, Generic[ObjectType]):
 
     @classmethod
     def _response_to_attributes(
-        cls: Type[ObjectType], response_data: Dict[str, str]
+        cls: Type[AccountManagerObjectType], response_data: Dict[str, str]
     ) -> Dict[str, str | None]:
         empty_variants = ("0-00:00:00", "", "0", "00:00:00")
         return {
@@ -175,9 +101,9 @@ class SlurmObject(ABC, Generic[ObjectType]):
 
     @classmethod
     def _response_to_instances(
-        cls: Type[ObjectType], response: Sequence[Dict[str, str]]
-    ) -> Sequence[ObjectType]:
-        instances: list[ObjectType] = []
+        cls: Type[AccountManagerObjectType], response: Sequence[Dict[str, str]]
+    ) -> Sequence[AccountManagerObjectType]:
+        instances: list[AccountManagerObjectType] = []
         for data in response:
             attributes = cls._response_to_attributes(data)
             instance = cls(**attributes)
@@ -201,7 +127,9 @@ class SlurmObject(ABC, Generic[ObjectType]):
         return update_fields, filter_fields
 
     @classmethod
-    async def filter(cls: Type[ObjectType], **filters: str) -> Sequence[ObjectType]:
+    async def filter(
+        cls: Type[AccountManagerObjectType], **filters: str
+    ) -> Sequence[AccountManagerObjectType]:
         object_fields = [
             snake_to_camel_case(field.name)
             for field in dataclasses.fields(cls)
@@ -215,28 +143,15 @@ class SlurmObject(ABC, Generic[ObjectType]):
         # only return the queried type of instance
         return [instance for instance in instances if isinstance(instance, cls)]
 
-    @classmethod
-    async def all(cls) -> Sequence[ObjectType]:
-        return await cls.filter()
 
-    @classmethod
-    async def get(cls, **filters: str) -> ObjectType:
-        user_list = await cls.filter(**filters)
-        if len(user_list) == 0:
-            raise NotFound(cls)
-        if len(user_list) > 1:
-            raise MultipleObjectReturned(cls)
-        return user_list[0]
-
-    async def refresh_from_db(self):
-        _, filters = self._to_query()
-        new_object = await self.get(**filters)
-        for field in dataclasses.fields(new_object):
-            del self.__dict__[field.name]
-            setattr(self, field.name, getattr(new_object, field.name))
+WritableAccountManagerObjectType = TypeVar(
+    "WritableAccountManagerObjectType", bound="WritableSlurmAccountManagerObject"
+)
 
 
-class WritableSlurmObject(SlurmObject[WritableObjectType]):
+class WritableSlurmAccountManagerObject(
+    SlurmAccountManagerObject[WritableAccountManagerObjectType]
+):
     @classmethod
     async def _scattmgr_write(
         cls,
@@ -267,7 +182,7 @@ class WritableSlurmObject(SlurmObject[WritableObjectType]):
         )
 
         if exit_code != 0:
-            raise SlurmAccountManagerError(process_output)
+            raise SlurmAccountManagerError(cls, process_output)
 
         if verb == "create":
             if "Nothing new added." in process_output:
@@ -293,13 +208,16 @@ class WritableSlurmObject(SlurmObject[WritableObjectType]):
         return modified_objects
 
     @classmethod
-    async def create(cls: Type[WritableObjectType], **attrs) -> WritableObjectType:
+    async def create(
+        cls: Type[WritableAccountManagerObjectType], **attrs
+    ) -> WritableAccountManagerObjectType:
         created_objects = await cls._scattmgr_write("create", attrs, {})
         if len(created_objects) == 1:
             return await cls.get(**attrs)
         else:
             raise SlurmAccountManagerError(
-                f"Failed to create new {cls.__name__}. Maybe the object already existed?"
+                cls,
+                f"Failed to create new {cls.__name__}. Maybe the object already existed?",
             )
 
     async def save(self) -> bool:
