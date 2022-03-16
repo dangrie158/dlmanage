@@ -122,7 +122,6 @@ class SlurmControlObject(SlurmCLIObject[SlurmControlObjectType]):
             cls.__name__,
             filter,
             *update_args,
-            "--immediate",
             error_ok=True,
         )
 
@@ -153,21 +152,21 @@ class SlurmControlObject(SlurmCLIObject[SlurmControlObjectType]):
             instances.append(instance)
         return instances
 
-    def _to_query(self) -> Tuple[Dict[str, str], str | None]:
+    def _to_query(self) -> Tuple[Dict[str, str], Dict[str, str]]:
         update_fields: Dict[str, str] = {}
-        filter_value = None
+        filter_values = {}
 
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
             if field.name in self._primary_key_fields:
-                filter_value = value
+                filter_values[field.name] = value
             elif (
                 field.name not in (self._read_only_fields + self._synthetic_fields)
                 and value
             ):
                 update_fields[snake_to_camel_case(field.name)] = value
 
-        return update_fields, filter_value
+        return update_fields, filter_values
 
     @classmethod
     async def filter(
@@ -192,5 +191,5 @@ class SlurmControlObject(SlurmCLIObject[SlurmControlObjectType]):
     async def save(self):
         updates, filters = self._to_query()
 
-        await self._scontrol_update(updates, filters)
+        await self._scontrol_update(updates, list(filters.values())[0])
         await self.refresh_from_db()

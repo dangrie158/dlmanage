@@ -192,16 +192,16 @@ class QOS(SlurmAccountManagerObject["QOS"]):
 class Job(SlurmControlObject["Job"]):
     job_id: str = field(primary_key=True)
     _: dataclasses.KW_ONLY
-    job_name: str
-    job_state: str
-    run_time: str
+    job_name: str = field(read_only=True)
+    job_state: str = field(read_only=True)
+    run_time: str = field(read_only=True)
     time_limit: str
-    tres: str
-    user_id: str
-    group_id: str
-    account: str
-    array_task_id: Optional[str] = None
-    reason: Optional[str] = None
+    tres: str = field(read_only=True)
+    user_id: str = field(read_only=True)
+    group_id: str = field(read_only=True)
+    account: str = field(read_only=True)
+    array_task_id: Optional[str] = field(read_only=True, default=None)
+    reason: Optional[str] = field(read_only=True, default=None)
 
     @cached_property
     def username(self) -> str:

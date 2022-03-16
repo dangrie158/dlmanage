@@ -6,6 +6,7 @@ from io import StringIO
 from rich.tree import Tree
 from rich.console import Console
 from textual.app import App
+from dlmanage.slurmbridge.scontrol import SlurmControlError
 
 from dlmanage.widgets.interactive_table import (
     EditableChoiceTableCell,
@@ -355,8 +356,7 @@ class JobListModel(InteractiveTableModel):
     def __init__(self, app: App, table_widget: InteractiveTable):
         super().__init__(app, table_widget)
         self._columns: Mapping[str, Mapping[str, Any]] = {
-            "user": {"ratio": 1, "no_wrap": True},
-            "Job ID": {"justify": "left", "ratio": 1, "no_wrap": True},
+            "Job ID": {"ratio": 2, "no_wrap": True},
             "Job Name": {"justify": "center", "ratio": 3, "no_wrap": True},
             "CPUs": {"justify": "right", "ratio": 1, "no_wrap": True},
             "GPUs": {"justify": "right", "ratio": 1, "no_wrap": True},
@@ -393,8 +393,6 @@ class JobListModel(InteractiveTableModel):
             return ""
 
         match (position.column):
-            case "user":
-                return row_object.username
             case "Job ID":
                 return tree_node
             case "Job Name":
@@ -406,7 +404,7 @@ class JobListModel(InteractiveTableModel):
             case "Memory":
                 return row_object.mem
             case "Timelimit":
-                return row_object.run_time
+                return row_object.time_limit
             case "Runtime":
                 cell_text = row_object.run_time
                 if row_object.job_state != "RUNNING":
@@ -425,17 +423,27 @@ class JobListModel(InteractiveTableModel):
             return TableCell, {}
 
         match (position.column):
-            case "user" | "Job ID" | "Job Name" | "Runtime":
+            case "Job ID" | "Job Name" | "Runtime" | "Memory":
                 return TableCell, {}
-            case "CPUs" | "GPUs":
-                return EditableIntTableCell, {"min_value": 0}
-            case "Memory" | "Timelimit":
+            case "CPUs" | "GPUs" | "Memory":
+                return TableCell, {"style": self.app.theme.int_cell}
+            case "Timelimit":
                 return EditableTableCell, {}
             case unknown_name:
                 raise AttributeError(f"Unknown column: {unknown_name}")
 
     async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
-        pass
+        row_object = self._data[position.row]
+        try:
+            match (position.column):
+                case "Timelimit":
+                    row_object.time_limit = new_value
+                    await row_object.save()
+                case unknown_name:
+                    raise AttributeError(f"Don't know how to change {unknown_name}")
+
+        except (SlurmControlError, SlurmObjectException) as error:
+            await self.app.display_error(error)
 
 
 class NodeListModel(InteractiveTableModel):

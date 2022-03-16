@@ -1,9 +1,11 @@
 from rich.style import Style, NULL_STYLE
 
 from textual import events
+from textual._timer import Timer
 from textual.app import App
 from textual.widgets import Header, ScrollView, TreeControl, TreeClick
 from textual.widget import Widget
+
 from textual import actions
 
 from dlmanage.widgets import (
@@ -103,6 +105,7 @@ class SlurmControl(App):
         # register the new model bindings
         if model is not None:
             self.header.sub_title = model.title
+
             self._action_targets.add("model")
             for binding in model.keys.values():
                 await self.bind(

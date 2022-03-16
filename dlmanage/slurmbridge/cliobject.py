@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 import dataclasses
-from typing import Any, ClassVar, Generic, Sequence, Type, TypeVar, Dict, List
+from typing import Any, ClassVar, Generic, Sequence, Tuple, Type, TypeVar, Dict, List
 
 
 READONLY = {"readonly": True}
@@ -90,12 +90,6 @@ class SlurmCLIObject(ABC, Generic[ObjectType]):
             if field.metadata is not None and field.metadata.get(type_key, False)
         ]
 
-    def __setattr__(self, __name: str, __value: Any) -> None:
-        # make writing to read-only fields a runtime error
-        if hasattr(self, __name) and __name in self._read_only_fields:
-            raise AttributeError(f"{__name} is a read-only field")
-        return super().__setattr__(__name, __value)
-
     @classmethod
     async def all(cls) -> Sequence[ObjectType]:
         return await cls.filter()
@@ -119,4 +113,9 @@ class SlurmCLIObject(ABC, Generic[ObjectType]):
     @classmethod
     @abstractmethod
     async def filter(cls: Type[ObjectType], **filters: str) -> Sequence[ObjectType]:
+        ...
+
+    @classmethod
+    @abstractmethod
+    def _to_query(self) -> Tuple[Dict[str, str], Dict[str, str]]:
         ...
