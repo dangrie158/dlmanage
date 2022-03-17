@@ -4,7 +4,20 @@ from copy import copy
 import dataclasses
 from datetime import datetime, timedelta
 from functools import cached_property
-from typing import Dict, List, Optional, Sequence, Tuple, TypeVar, cast
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypeVar,
+    cast,
+)
 from dlmanage.slurmbridge.common import (
     get_gres_value,
     update_gres_value,
@@ -16,7 +29,8 @@ from dlmanage.slurmbridge.sacctmgr import (
     SlurmAccountManagerObject,
     WritableSlurmAccountManagerObject,
 )
-from dlmanage.slurmbridge.scontrol import SlurmControlObject
+from dlmanage.slurmbridge.scontrol import SlurmControlError, SlurmControlObject
+from dlmanage.slurmbridge.scancel import SlurmCancelObject
 
 AssociationType = TypeVar("AssociationType", bound="Association")
 
@@ -189,19 +203,22 @@ class QOS(SlurmAccountManagerObject["QOS"]):
 
 
 @dataclasses.dataclass
-class Job(SlurmControlObject["Job"]):
+class Job(SlurmControlObject["Job"], SlurmCancelObject):
     job_id: str = field(primary_key=True)
     _: dataclasses.KW_ONLY
-    job_name: str = field(read_only=True)
-    job_state: str = field(read_only=True)
-    run_time: str = field(read_only=True)
-    time_limit: str
-    tres: str = field(read_only=True)
-    user_id: str = field(read_only=True)
-    group_id: str = field(read_only=True)
-    account: str = field(read_only=True)
-    array_task_id: Optional[str] = field(read_only=True, default=None)
-    reason: Optional[str] = field(read_only=True, default=None)
+    job_name: str = field(repr=False, read_only=True)
+    job_state: str = field(repr=False, read_only=True)
+    run_time: str = field(repr=False, read_only=True)
+    time_limit: str = field(repr=False)
+    node_list: str = field(repr=False, read_only=True)
+    tres: str = field(repr=False, read_only=True)
+    user_id: str = field(repr=False, read_only=True)
+    group_id: str = field(repr=False, read_only=True)
+    account: str = field(repr=False, read_only=True)
+    gres: Optional[str] = field(repr=False, write_only=True, default=None)
+    num_cpus: Optional[str] = field(repr=False, write_only=True, default=None)
+    array_task_id: Optional[str] = field(repr=False, read_only=True, default=None)
+    reason: Optional[str] = field(repr=False, read_only=True, default=None)
 
     @cached_property
     def username(self) -> str:
@@ -216,6 +233,26 @@ class Job(SlurmControlObject["Job"]):
             job_id += f"[{self.array_task_id}]"
         return job_id
 
+    @property
+    def cpus(self) -> str | None:
+        return get_gres_value(self.tres, "cpu")
+
+    async def set_cpus(self, new_value: str):
+        self.num_cpus = f"{new_value}"
+        return await self.save()
+
+    @property
+    def memory(self) -> str | None:
+        return get_gres_value(self.tres, "mem")
+
+    @property
+    def gpus(self) -> str | None:
+        return get_gres_value(self.tres, "gres/gpu")
+
+    async def set_gpus(self, new_value: str):
+        self.gres = f"gpu:{new_value}"
+        return await self.save()
+
     async def get_user(self) -> User:
         user_name = self.username
         return await User.get(user=user_name, account=self.account)
@@ -223,30 +260,45 @@ class Job(SlurmControlObject["Job"]):
     async def get_account(self) -> Account:
         return await Account.get(account=self.account)
 
-    @property
-    def cpus(self) -> str | None:
-        return get_gres_value(self.tres, "cpu")
+    async def hold(self):
+        if self.job_state == "RUNNING":
+            raise SlurmControlError(
+                self.__class__, f"Job {self.job_id} is already running"
+            )
+        return await self._scontrol_execute("uhold", self.job_id)
 
-    @property
-    def mem(self) -> str | None:
-        return get_gres_value(self.tres, "mem")
+    async def release(self):
+        if self.job_state == "RUNNING":
+            raise SlurmControlError(
+                self.__class__, f"Job {self.job_id} is already running"
+            )
+        return await self._scontrol_execute("release", self.job_id)
 
-    @property
-    def gpus(self) -> str | None:
-        return get_gres_value(self.tres, "gres/gpu")
+    async def cancel(self):
+        signal = "SIGTERM" if self.job_state == "RUNNING" else None
+        return await self._scancel_execute(self.job_id, signal)
+
+    async def kill(self):
+        signal = "SIGKILL" if self.job_state == "RUNNING" else None
+        return await self._scancel_execute(self.job_id, signal)
 
 
 @dataclasses.dataclass
 class Node(SlurmControlObject["Node"]):
+    query_options = ("--future",)
+    query_type = Literal["ValueOnly"]
+    STATES: ClassVar[List[str]] = ["CANCEL_REBOOT", "DOWN", "DRAIN", "FUTURE", "RESUME"]
+
     node_name: str = field(primary_key=True)
     _: dataclasses.KW_ONLY
-    cpualloc: str
-    cputot: str
-    cpuload: str | None
-    gres: str | None
-    gres_used: str | None
-    boot_time: str | None
-    state: str
+    cpualloc: str | None = field(repr=False, read_only=True, default=None)
+    cputot: str | None = field(repr=False, read_only=True, default=None)
+    cpuload: str | None = field(repr=False, read_only=True, default=None)
+    gres: str | None = field(repr=False, read_only=True, default=None)
+    gres_used: str | None = field(repr=False, read_only=True, default=None)
+    boot_time: str | None = field(repr=False, read_only=True, default=None)
+    state: str | None = field(repr=False, read_only=True, default=None)
+    reason: str | None = field(repr=False, read_only=True, default=None)
 
     @cached_property
     def uptime(self) -> timedelta | None:
@@ -266,7 +318,7 @@ class Node(SlurmControlObject["Node"]):
 
     @cached_property
     def cpu_allocation(self) -> Tuple[str, str]:
-        return self.cpualloc, self.cputot
+        return self.cpualloc or "n", self.cputot or "a"
 
     @cached_property
     def gpu_allocation(self) -> Tuple[str, str]:
@@ -292,3 +344,19 @@ class Node(SlurmControlObject["Node"]):
     def allocated_gpus(self) -> Sequence[str]:
         # example gres_used string: "gpu:turing:0(IDX:N/A)"
         return []
+
+    async def reboot(self, reason: str, force=False):
+        args = []
+        if force:
+            args.append("ASAP")
+        args.append("nextstate=RESUME")
+        args.append(f"reason=´{reason}")
+        return await self._scontrol_execute("reboot", self.node_name, args)
+
+    async def set_state(self, new_state: str, reason: Optional[str] = None):
+        _, filters = self._to_query()
+        new_values = {"State": new_state}
+        if reason is not None:
+            new_values["Reason"] = reason
+        await self._scontrol_update(new_values, filters)
+        await self.refresh_from_db()

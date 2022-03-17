@@ -111,6 +111,7 @@ class Footer(Widget):
         if self.error_message is not None:
             await self.emit(ErrorDismissed(self))
             self.error_message = None
+            return
 
         if self.prompt_message is None:
             return

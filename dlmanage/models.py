@@ -91,7 +91,7 @@ def build_account_tree(root_node: Association) -> Sequence[str]:
 
 def build_job_tree(jobs: Sequence[Job], attribute_name: str):
     jobs_by_attribute: defaultdict[str, List[Job]] = defaultdict(list)
-    joblist_for_tree: Sequence[Job, None] = []
+    joblist_for_tree: List[Job | None] = []
     tree = Tree("All Jobs", hide_root=True)
     for job in jobs:
         jobs_by_attribute[getattr(job, attribute_name)].append(job)
@@ -123,13 +123,9 @@ class AssociationListModel(InteractiveTableModel):
             "Home Directory": {"justify": "right", "ratio": 2, "no_wrap": True},
         }
 
-        self.bind("f5", "refresh", "Refresh")
         self.bind("ctrl+a", "add_account", "Add a new Account")
         self.bind("ctrl+u", "add_user", "Add a new User")
         self.bind("ctrl+d", "delete_entry", "Delete Entry")
-
-    async def action_refresh(self):
-        await self.refresh()
 
     async def action_add_account(self):
         current_selection = self.table_widget.selection_position or TablePosition("", 0)
@@ -282,10 +278,9 @@ class AssociationListModel(InteractiveTableModel):
                 }
             case "user":
                 # only user objects can set a new name
-                cell_class = (
-                    EditableTableCell if isinstance(row_object, User) else TableCell
-                )
-                return cell_class, {}
+                is_user = isinstance(row_object, User)
+                cell_class = EditableTableCell if is_user else TableCell
+                return cell_class, {"can_focus": is_user}
             case "CPUs":
                 hint, placeholder = get_bottleneck_hint(row_object, "max_cpus")
                 return EditableIntTableCell, {
@@ -303,7 +298,10 @@ class AssociationListModel(InteractiveTableModel):
             case "Timelimit":
                 return EditableTableCell, {}
             case "Home Directory":
-                return TableCell, {"placeholder": "<home dir does not exist>"}
+                return TableCell, {
+                    "can_focus": False,
+                    "placeholder": "<home dir does not exist>",
+                }
             case unknown_name:
                 raise AttributeError(f"Unknown column: {unknown_name}")
 
@@ -362,16 +360,50 @@ class JobListModel(InteractiveTableModel):
             "GPUs": {"justify": "right", "ratio": 1, "no_wrap": True},
             "Memory": {"justify": "right", "ratio": 1, "no_wrap": True},
             "Timelimit": {"justify": "right", "ratio": 2, "no_wrap": True},
+            "Node": {"justify": "right", "ratio": 1, "no_wrap": True},
             "Runtime": {"justify": "right", "ratio": 2, "no_wrap": True},
         }
 
-        self.bind("f5", "refresh", "Refresh")
-        self.bind("ctrl+x", "cancel_job", "Cancel Job")
-        self.bind("ctrl+h", "hold_job", "Put on Hold")
-        self.bind("ctrl+r", "unhold_job", "Remove Hold")
+        self.bind("ctrl+d", "run_on_current_selection('cancel', True)", "Cancel Job")
+        self.bind("ctrl+x", "run_on_current_selection('kill', True)", "Kill Job")
+        self.bind("ctrl+p", "run_on_current_selection('hold', False)", "Put on Hold")
+        self.bind(
+            "ctrl+r", "run_on_current_selection('release', False)", "Release Hold"
+        )
 
-    async def action_refresh(self):
+    async def action_run_on_current_selection(
+        self, action_name: str, needs_confirmation: bool
+    ):
+        try:
+            current_selection = self.table_widget.selection_position
+            selected_job = self._tree_list[current_selection.row]
+        except (AttributeError, IndexError):
+            return await self.app.display_error("No Job selected")
+
+        if needs_confirmation:
+            return await self.app.confirm(
+                f'Do you really want to {action_name} the Job "{selected_job.job_name}" ({selected_job.job_id_with_array})',
+                f"model.{action_name}_confirmed('{current_selection.column}', {current_selection.row})",
+            )
+
+        try:
+            action = getattr(selected_job, action_name)
+            await action()
+        except (SlurmControlError, SlurmObjectException) as error:
+            await self.app.display_error(error)
         await self.refresh()
+
+    async def action_kill_confirmed(
+        self, _: str, row: int, response: str, is_confirmed: bool
+    ):
+        if is_confirmed:
+            await self._tree_list[row].kill()
+
+    async def action_cancel_confirmed(
+        self, _: str, row: int, response: str, is_confirmed: bool
+    ):
+        if is_confirmed:
+            await self._tree_list[row].cancel()
 
     async def load_data(self):
         self._data = await Job.all()
@@ -402,9 +434,11 @@ class JobListModel(InteractiveTableModel):
             case "GPUs":
                 return row_object.gpus
             case "Memory":
-                return row_object.mem
+                return row_object.memory
             case "Timelimit":
                 return row_object.time_limit
+            case "Node":
+                return row_object.node_list or ""
             case "Runtime":
                 cell_text = row_object.run_time
                 if row_object.job_state != "RUNNING":
@@ -420,28 +454,34 @@ class JobListModel(InteractiveTableModel):
     ) -> Tuple[Type[TableCell], Dict[str, Any]]:
         row_object = self._tree_list[position.row]
         if row_object is None:
-            return TableCell, {}
+            return TableCell, {"can_focus": False}
 
         match (position.column):
             case "Job ID" | "Job Name" | "Runtime" | "Memory":
                 return TableCell, {}
-            case "CPUs" | "GPUs" | "Memory":
-                return TableCell, {"style": self.app.theme.int_cell}
+            case "CPUs" | "GPUs":
+                return EditableIntTableCell, {"min_value": 0, "placeholder": "None"}
+            case "Node":
+                return TableCell, {"placeholder": "", "can_focus": False}
             case "Timelimit":
                 return EditableTableCell, {}
             case unknown_name:
                 raise AttributeError(f"Unknown column: {unknown_name}")
 
     async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
-        row_object = self._data[position.row]
+        affected_object = self._tree_list[position.row]
         try:
             match (position.column):
+                case "CPUs":
+                    await affected_object.set_cpus(new_value)
+                case "GPUs":
+                    await affected_object.set_gpus(new_value)
                 case "Timelimit":
-                    row_object.time_limit = new_value
-                    await row_object.save()
+                    affected_object.time_limit = new_value
+                    await affected_object.save()
                 case unknown_name:
                     raise AttributeError(f"Don't know how to change {unknown_name}")
-
+            await self.refresh()
         except (SlurmControlError, SlurmObjectException) as error:
             await self.app.display_error(error)
 
@@ -458,10 +498,47 @@ class NodeListModel(InteractiveTableModel):
             "GPU Load": {"justify": "center", "ratio": 2, "no_wrap": True},
             "Uptime": {"justify": "right", "ratio": 1, "no_wrap": True},
         }
-        self.bind("f5", "refresh", "Refresh")
+        self.bind("ctrl+r", "prompt_reboot_reason_selected_node(False)", "Reboot Node")
+        self.bind("ctrl+x", "prompt_reboot_reason_selected_node(True)", "Force Reboot")
 
-    async def action_refresh(self):
-        await self.refresh()
+    async def prompt_for_reason(self, target_node: str, target_state: str):
+        await self.app.prompt(
+            f"Specify a reason for the new {target_state} state",
+            f"model.set_node_state('{target_node}', '{target_state}')",
+        )
+
+    async def action_prompt_reboot_reason_selected_node(self, force: bool):
+        try:
+            current_selection = self.table_widget.selection_position
+            selected_node = self._data[current_selection.row]
+        except (AttributeError, IndexError):
+            return await self.app.display_error("No Node selected")
+
+        return await self.app.prompt(
+            f'Specify the Reboot reason for "{selected_node.node_name}"',
+            f"model.reboot_node({current_selection.row}, {force})",
+        )
+
+    async def action_reboot_node(
+        self, row: int, force: bool, reason: str, confirmed: bool
+    ):
+        if not confirmed:
+            return
+        try:
+            node_to_reboot = self._data[row]
+            await node_to_reboot.reboot(reason, force)
+        except (SlurmControlError, SlurmObjectException) as error:
+            await self.app.display_error(error)
+
+    async def action_set_node_state(
+        self, target_node: str, target_state: str, reason: str, confirmed: bool
+    ):
+        if confirmed:
+            try:
+                node_to_update = Node(node_name=target_node)
+                await node_to_update.set_state(target_state, reason)
+            except (SlurmControlError, SlurmObjectException) as error:
+                await self.app.display_error(error)
 
     async def load_data(self):
         self._data = await Node.all()
@@ -481,7 +558,10 @@ class NodeListModel(InteractiveTableModel):
             case "Node Name":
                 return row_object.node_name
             case "State":
-                return row_object.state
+                cell_text = row_object.state
+                if row_object.reason is not None:
+                    cell_text += f" ({row_object.reason})"
+                return cell_text
             case "CPU Load":
                 allocated, total = row_object.cpu_allocation
                 return f"{allocated} / {total}"
@@ -500,25 +580,46 @@ class NodeListModel(InteractiveTableModel):
         current_load: float = 0
         match (position.column):
             case "Node Name" | "Uptime":
-                return TableCell, {}
+                return TableCell, {"can_focus": False}
             case "CPU Load":
                 try:
                     allocated, total = row_object.cpu_allocation
                     current_load = (int(allocated) / int(total)) * 100
                 except ValueError:
                     pass
-                return ProgressTableCell, {"fill_percent": current_load}
+                return ProgressTableCell, {
+                    "can_focus": False,
+                    "fill_percent": current_load,
+                }
             case "GPU Load":
                 try:
                     allocated, total = row_object.gpu_allocation
                     current_load = (int(allocated) / int(total)) * 100
                 except ValueError:
                     pass
-                return ProgressTableCell, {"fill_percent": current_load}
+                return ProgressTableCell, {
+                    "can_focus": False,
+                    "fill_percent": current_load,
+                }
             case "State":
-                return EditableChoiceTableCell, {"choices": ["Up", "Reboot"]}
+                return EditableChoiceTableCell, {"choices": Node.STATES}
             case unknown_name:
                 raise AttributeError(f"Unknown column: {unknown_name}")
 
     async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
-        pass
+        affected_object = self._data[position.row]
+        try:
+            match (position.column):
+                case "State":
+                    if new_value in ("DOWN", "DRAIN"):
+                        return await self.prompt_for_reason(
+                            affected_object.node_name, new_value
+                        )
+                    else:
+                        await affected_object.set_state(new_value)
+                case unknown_name:
+                    raise AttributeError(f"Don't know how to change {unknown_name}")
+            await self.refresh()
+
+        except (SlurmControlError, SlurmObjectException) as error:
+            await self.app.display_error(error)

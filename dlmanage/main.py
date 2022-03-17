@@ -78,6 +78,9 @@ class SlurmControl(App):
         await self.set_focus(self.sidebar_content)
         await self.load_model(AssociationListModel(self, self.main_content))
 
+        # set a timer to always keep the current model updated
+        self.set_interval(1.0, self.refresh_model)
+
     async def set_focus(self, widget: Widget | None) -> None:
         if self.focused == widget:
             return
@@ -93,6 +96,10 @@ class SlurmControl(App):
             await self.main_content.focus()
         else:
             await self.sidebar_content.focus()
+
+    async def refresh_model(self):
+        if self.model is not None and not self.main_content.is_in_edit_mode:
+            await self.model.refresh()
 
     async def load_model(self, model: InteractiveTableModel) -> None:
         self.main_content.is_loading = True
@@ -158,7 +165,7 @@ class SlurmControl(App):
         await self.action(action_to_fire)
         self.current_response_action = None
 
-    async def display_error(self, error: Exception):
+    async def display_error(self, error: Exception | str):
         await self.set_focus(self.footer)
         self.main_content.can_focus = False
         self.sidebar_content.can_focus = False

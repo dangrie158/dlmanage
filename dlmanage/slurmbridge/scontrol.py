@@ -6,6 +6,8 @@ import shutil
 from typing import (
     ClassVar,
     Dict,
+    List,
+    Literal,
     Mapping,
     Optional,
     Sequence,
@@ -33,16 +35,7 @@ SlurmControlObjectType = TypeVar("SlurmControlObjectType", bound="SlurmControlOb
 
 class SlurmControlObject(SlurmCLIObject[SlurmControlObjectType]):
     query_options: ClassVar[Sequence[str]] = tuple()
-    _primary_key_field: ClassVar[str]
-
-    def __init_subclass__(cls) -> None:
-        super().__init_subclass__()
-        if len(cls._primary_key_fields) != 1:
-            raise SlurmControlError(
-                cls,
-                f"{cls.__name__} must define exactly one field with primary_key=True",
-            )
-        cls._primary_key_field = cls._primary_key_fields[0]
+    query_type: ClassVar[Literal["Normal", "ValueOnly"]] = "Normal"
 
     @classmethod
     async def _run_scontrol_command(
@@ -76,12 +69,24 @@ class SlurmControlObject(SlurmCLIObject[SlurmControlObjectType]):
     async def _scontrol_show(
         cls,
         fields: Sequence[str],
-        filter: Optional[str] = None,
+        filters: Dict[str, str],
     ) -> Sequence[Dict[str, str]]:
-        filter_args = [filter] if filter is not None else []
+        filter_args: list[str] = []
+
+        # in scontrol you pass the object type to get all entries of an object
+        # OR you pass a primary key to filter for specific instances but you can't do both
+        if len(filters) > 0:
+            if cls.query_type == Literal["ValueOnly"]:
+                filter_args.append(cls.__name__)
+                filter_args.append(f"{list(filters.values())[0]}")
+            else:
+                for column, value in filters.items():
+                    filter_args.append(f"{column}={value}")
+        else:
+            filter_args.append(cls.__name__)
 
         exit_code, process_output = await cls._run_scontrol_command(
-            "show", cls.__name__, *filter_args, *cls.query_options
+            "show", *filter_args, *cls.query_options
         )
         if exit_code != 0:
             raise SlurmControlError(cls, process_output)
@@ -96,31 +101,52 @@ class SlurmControlObject(SlurmCLIObject[SlurmControlObjectType]):
                 # sometimes an attribute is not followed by a value (e.g. "Name=")
                 # so we pack second argument to a list but thanks to maxsplit=1
                 # this list is either empty or has exactly one entry
-                attribute_name, *value = attribute_string.split("=", maxsplit=1)
+                attribute_name, *attribute_value = attribute_string.split(
+                    "=", maxsplit=1
+                )
                 # we need to use case insensitive matching here since slurm
                 # uses SREAMINGCASE for abbrevations (e.g. TRES instead of Tres)
                 if attribute_name.lower() in case_insensitive_fields:
                     object_attributes[attribute_name] = (
-                        value[0] if len(value) == 1 else ""
+                        attribute_value[0] if len(attribute_value) == 1 else ""
                     )
             all_objects.append(object_attributes)
 
         return all_objects
 
     @classmethod
+    async def _scontrol_execute(
+        cls, verb: str, filter: str, extra_args: Optional[List[str]] = None
+    ):
+        if extra_args is None:
+            extra_args = []
+        exit_code, process_output = await cls._run_scontrol_command(
+            verb,
+            *extra_args,
+            filter,
+            error_ok=True,
+        )
+
+        if exit_code != 0:
+            raise SlurmControlError(cls, process_output)
+
+    @classmethod
     async def _scontrol_update(
         cls,
         new_values: Mapping[str, str],
-        filter: str,
+        filters: Mapping[str, str],
     ):
         update_args: list[str] = []
         for field_name, new_value in new_values.items():
             update_args.append(f"{field_name}={new_value}")
 
+        filter_args = []
+        for column, value in filters.items():
+            filter_args.append(f"{column}={value}")
+
         exit_code, process_output = await cls._run_scontrol_command(
             "update",
-            cls.__name__,
-            filter,
+            *filter_args,
             *update_args,
             error_ok=True,
         )
@@ -159,7 +185,7 @@ class SlurmControlObject(SlurmCLIObject[SlurmControlObjectType]):
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
             if field.name in self._primary_key_fields:
-                filter_values[field.name] = value
+                filter_values[snake_to_camel_case(field.name)] = value
             elif (
                 field.name not in (self._read_only_fields + self._synthetic_fields)
                 and value
@@ -172,18 +198,12 @@ class SlurmControlObject(SlurmCLIObject[SlurmControlObjectType]):
     async def filter(
         cls: Type[SlurmControlObjectType], **filters: str
     ) -> Sequence[SlurmControlObjectType]:
-        if len(filters) > 1:
-            raise SlurmControlError(
-                cls,
-                f"{cls.__name__} only supports a single filter attribute: {cls._primary_key_field}",
-            )
-        filter_value = filters.get(cls._primary_key_field, None)
         object_fields = [
             snake_to_camel_case(field.name)
             for field in dataclasses.fields(cls)
             if field.name not in (cls._synthetic_fields + cls._write_only_fields)
         ]
-        object_data = await cls._scontrol_show(object_fields, filter_value)
+        object_data = await cls._scontrol_show(object_fields, filters)
         instances = cls._response_to_instances(object_data)
         # only return the queried type of instance
         return [instance for instance in instances if isinstance(instance, cls)]
@@ -191,5 +211,5 @@ class SlurmControlObject(SlurmCLIObject[SlurmControlObjectType]):
     async def save(self):
         updates, filters = self._to_query()
 
-        await self._scontrol_update(updates, list(filters.values())[0])
+        await self._scontrol_update(updates, filters)
         await self.refresh_from_db()

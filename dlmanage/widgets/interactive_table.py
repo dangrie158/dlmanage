@@ -7,6 +7,7 @@ from typing import (
     ClassVar,
     Dict,
     Iterable,
+    List,
     Mapping,
     NamedTuple,
     Optional,
@@ -67,12 +68,14 @@ class TableCell(Widget):
         theme: Optional[TableTheme] = None,
         placeholder: str = "<undefined>",
         hint: Optional[str] = None,
+        can_focus: bool = False,
     ):
         super().__init__(f"TableCell<{position.column}:{position.row}>")
         self.position = position
         self.placeholder = placeholder
         self.hint = hint
         self.text = text
+        self.can_focus = can_focus
         self.theme = theme or TableTheme()
         style = style or self.theme.cell
         self.base_style = style + Style(
@@ -106,13 +109,15 @@ class TableCell(Widget):
         pass
 
     def focus(self):
-        self.is_focused = True
+        if self.can_focus:
+            self.is_focused = True
 
     def unfocus(self):
         self.is_focused = False
 
     def hover_enter(self):
-        self.is_hovered = True
+        if self.can_focus:
+            self.is_hovered = True
 
     def hover_leave(self):
         self.is_hovered = False
@@ -129,10 +134,17 @@ class ProgressTableCell(TableCell):
         theme: Optional[TableTheme] = None,
         placeholder: str = "<undefined>",
         hint: Optional[str] = None,
+        can_focus: bool = False,
     ):
         self.fill_percent = fill_percent
         super().__init__(
-            position, text, style=style, theme=theme, placeholder=placeholder, hint=hint
+            position,
+            text,
+            style=style,
+            theme=theme,
+            placeholder=placeholder,
+            hint=hint,
+            can_focus=can_focus,
         )
 
     def render(self) -> RenderableType:
@@ -159,11 +171,18 @@ class EditableTableCell(TableCell):
         theme: Optional[TableTheme] = None,
         placeholder: str = "<undefined>",
         hint: Optional[str] = None,
+        can_focus: bool = True,
     ):
         theme = theme or TableTheme()
         style = style or theme.text_cell
         super().__init__(
-            position, text, style=style, theme=theme, placeholder=placeholder, hint=hint
+            position,
+            text,
+            style=style,
+            theme=theme,
+            placeholder=placeholder,
+            hint=hint,
+            can_focus=can_focus,
         )
 
     async def begin_editing(self):
@@ -274,6 +293,7 @@ class EditableIntTableCell(EditableTableCell):
         hint: Optional[str] = None,
         max_value: Optional[int] = None,
         min_value: Optional[int] = None,
+        can_focus: bool = True,
     ):
         self.min_value = min_value
         self.max_value = max_value
@@ -281,7 +301,13 @@ class EditableIntTableCell(EditableTableCell):
         theme = theme or TableTheme()
         style = style or theme.int_cell
         super().__init__(
-            position, text, style=style, theme=theme, placeholder=placeholder, hint=hint
+            position,
+            text,
+            style=style,
+            theme=theme,
+            placeholder=placeholder,
+            hint=hint,
+            can_focus=can_focus,
         )
 
     async def begin_editing(self):
@@ -327,8 +353,9 @@ class EditableChoiceTableCell(EditableTableCell):
         theme: Optional[TableTheme] = None,
         placeholder: str = "<undefined>",
         hint: Optional[str] = None,
-        choices: Optional[Sequence[str]] = None,
+        choices: Optional[List[str]] = None,
         selected_index: Optional[int] = 0,
+        can_focus: bool = True,
     ):
         self.choices = choices or ([text] if text else [])
 
@@ -336,7 +363,13 @@ class EditableChoiceTableCell(EditableTableCell):
         style = style or theme.choice_cell
         self.selected_index = selected_index
         super().__init__(
-            position, text, style=style, theme=theme, placeholder=placeholder, hint=hint
+            position,
+            text,
+            style=style,
+            theme=theme,
+            placeholder=placeholder,
+            hint=hint,
+            can_focus=can_focus,
         )
 
     def to_value(self):
@@ -679,6 +712,9 @@ class InteractiveTable(Widget):
             # give the cell a chance to handle the event
             active_cell = self.cells[self.selection_position]
             await active_cell.on_key(event)
+            # of the key event put the cell into edit mode,  reflect the state
+            if isinstance(active_cell, EditableTableCell) and active_cell.is_editing:
+                self.is_in_edit_mode = True
             if event._stop_propagation:
                 self.refresh()
                 return

@@ -115,7 +115,6 @@ class SlurmCLIObject(ABC, Generic[ObjectType]):
     async def filter(cls: Type[ObjectType], **filters: str) -> Sequence[ObjectType]:
         ...
 
-    @classmethod
     @abstractmethod
     def _to_query(self) -> Tuple[Dict[str, str], Dict[str, str]]:
         ...
