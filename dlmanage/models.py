@@ -106,6 +106,7 @@ def build_job_tree(jobs: Sequence[Job], attribute_name: str):
     tree_buffer = StringIO()
     console = Console(file=tree_buffer, width=500)
     console.print(tree)
+
     return tree_buffer.getvalue().splitlines(), joblist_for_tree
 
 
@@ -406,8 +407,21 @@ class JobListModel(InteractiveTableModel):
             await self._tree_list[row].cancel()
 
     async def load_data(self):
-        self._data = await Job.all()
-        self._job_tree, self._tree_list = build_job_tree(self._data, "username")
+        unordered_jobs = await Job.all()
+
+        def sort_function(job: Job):
+            # None states are always at the top, then go all running jobs,
+            # followed by a list of completed and pending jobs
+            match job.job_state:
+                case None:
+                    return str(job.username) + "0" + str(job.job_id_with_array)
+                case "RUNNING":
+                    return str(job.username) + "1" + str(job.job_id_with_array)
+                case other:
+                    return str(job.username) + str(other) + str(job.job_id_with_array)
+
+        sorted_jobs = sorted(unordered_jobs, key=sort_function)
+        self._job_tree, self._tree_list = build_job_tree(sorted_jobs, "username")
 
     def get_columns(self) -> Iterable[str]:
         return self._columns.keys()

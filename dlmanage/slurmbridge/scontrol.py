@@ -158,7 +158,7 @@ class SlurmControlObject(SlurmCLIObject[SlurmControlObjectType]):
     def _response_to_attributes(
         cls: Type[SlurmControlObjectType], response_data: Dict[str, str]
     ) -> Dict[str, str | None]:
-        empty_variants = ("(null)", "N/A")
+        empty_variants = ("(null)", "N/A", "None")
         return {
             # some values will always return a value although they are empty
             # we need to ignore them here to make sure not to set these values
