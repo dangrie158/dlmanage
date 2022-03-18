@@ -1,9 +1,11 @@
 from __future__ import annotations
+import asyncio
 from copy import copy
 
 import dataclasses
 from datetime import datetime, timedelta
 from functools import cached_property
+from pathlib import Path
 from typing import (
     Any,
     ClassVar,
@@ -217,6 +219,8 @@ class Job(SlurmControlObject["Job"], SlurmCancelObject):
     account: str = field(repr=False, read_only=True)
     gres: Optional[str] = field(repr=False, write_only=True, default=None)
     num_cpus: Optional[str] = field(repr=False, write_only=True, default=None)
+    std_out: Optional[str] = field(repr=False, write_only=True, default=None)
+    std_err: Optional[str] = field(repr=False, write_only=True, default=None)
     array_task_id: Optional[str] = field(repr=False, read_only=True, default=None)
     reason: Optional[str] = field(repr=False, read_only=True, default=None)
 

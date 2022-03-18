@@ -110,11 +110,10 @@ def build_job_tree(jobs: Sequence[Job], attribute_name: str):
     return tree_buffer.getvalue().splitlines(), joblist_for_tree
 
 
-class AssociationListModel(InteractiveTableModel):
+class AssociationListModel(InteractiveTableModel[User | Account]):
     title = "Users and Accounts"
 
-    def __init__(self, app: App, table_widget: InteractiveTable):
-        super().__init__(app, table_widget)
+    def __init__(self):
         self._columns: Mapping[str, Mapping[str, Any]] = {
             "account": {"ratio": 3, "no_wrap": True},
             "user": {"ratio": 2, "no_wrap": True},
@@ -124,108 +123,24 @@ class AssociationListModel(InteractiveTableModel):
             "Home Directory": {"justify": "right", "ratio": 2, "no_wrap": True},
         }
 
-        self.bind("ctrl+a", "add_account", "Add a new Account")
-        self.bind("ctrl+u", "add_user", "Add a new User")
-        self.bind("ctrl+d", "delete_entry", "Delete Entry")
-
-    async def action_add_account(self):
-        current_selection = self.table_widget.selection_position or TablePosition("", 0)
-        await self.app.prompt(
-            "Enter the new accountname",
-            f"model.accountname_entered('{current_selection.column}', {current_selection.row})",
-        )
-
-    async def action_accountname_entered(
-        self, column: str, row: int, accountname: str, confirmed: bool
-    ):
-        if confirmed:
-            # try to find the next account up the hierarchy from the selected
-            # row "upwards"
-            parent = self._data[row]
-            while not isinstance(parent, Account):
-                parent = parent.parent_object
-            parent_name = parent.account or "root"
-            try:
-                new_account = await Account.create(account=accountname)
-                with suppress(SlurmObjectException):
-                    await new_account.set_parent(parent_name)
-                await self.refresh()
-                next_row = await self.get_next_row_matching(
-                    0, accountname, ("account",)
-                )
-                if next_row is not None:
-                    self.table_widget.selection_position = TablePosition("", next_row)
-            except (SlurmAccountManagerError, SlurmObjectException) as error:
-                await self.app.display_error(error)
-
-    async def action_add_user(self):
-        current_selection = self.table_widget.selection_position or TablePosition("", 0)
-        await self.app.prompt(
-            "Enter the new username",
-            f"model.username_entered('{current_selection.column}', {current_selection.row})",
-        )
-
-    async def action_username_entered(
-        self, column: str, row: int, username: str, confirmed: bool
-    ):
-        if confirmed:
-            try:
-                # try to find the next account up the hierarchy from the selected
-                # row "upwards"
-                initial_account = self._data[row]
-                while not isinstance(initial_account, Account):
-                    initial_account = initial_account.parent_object
-                initial_account_name = initial_account.account or "root"
-                await User.create(user=username, account=initial_account_name)
-                await self.refresh()
-                next_row = await self.get_next_row_matching(0, username, ("user",))
-                if next_row:
-                    self.table_widget.selection_position = TablePosition(
-                        column, next_row
-                    )
-            except (SlurmAccountManagerError, SlurmObjectException) as error:
-                await self.app.display_error(error)
-
-    async def action_delete_entry(self):
-        current_selection = self.table_widget.selection_position
-        if current_selection is None:
-            await self.app.display_error("Nothing selected")
-            return
-        object_to_delete = self._data[current_selection.row]
-        await self.app.confirm(
-            f"Do you really want to delete the {object_to_delete}",
-            f"model.delete_confirmed('{current_selection.column}', {current_selection.row})",
-        )
-
-    async def action_delete_confirmed(
-        self, column: str, row: int, reponse: str, confirmed: bool
-    ):
-        if confirmed:
-            object_to_delete = self._data[row]
-            try:
-                await object_to_delete.delete()
-                await self.refresh()
-                self.table_widget.selection_position = TablePosition(
-                    column, min(row, len(self._data) - 1)
-                )
-            except (SlurmAccountManagerError, SlurmObjectException) as error:
-                await self.app.display_error(error)
-
     async def load_data(self):
         self._data = await Association.all()
         self._available_accounts = await Account.all()
         self.account_tree = build_account_tree(self._data[0])
 
-    def get_columns(self) -> Iterable[str]:
+    def get_columns(self):
         return self._columns.keys()
 
-    def get_num_rows(self) -> int:
+    def get_num_rows(self):
         return len(self._data)
 
-    def get_column_kwargs(self, column_name: str) -> Mapping[str, Any]:
+    def get_column_kwargs(self, column_name: str):
         return self._columns.get(column_name, {})
 
-    async def get_cell(self, position: TablePosition) -> str | None:
+    def get_data_object_for_row(self, row: int):
+        return self._data[row]
+
+    async def get_cell(self, position: TablePosition):
         column, row = position
         row_object = self._data[row]
         cell_text: str | None = None
@@ -306,54 +221,12 @@ class AssociationListModel(InteractiveTableModel):
             case unknown_name:
                 raise AttributeError(f"Unknown column: {unknown_name}")
 
-    async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
-        affected_object = self._data[position.row]
-        try:
-            match position.column:
-                case "account":
-                    new_account = await Account.get(account=new_value)
-                    next_row = None
-                    if isinstance(affected_object, User):
-                        await affected_object.set_account(new_account)
-                        await self.load_data()
-                        next_row = await self.get_next_row_matching(
-                            0, affected_object.user, ("user",)
-                        )
-                    else:
-                        await affected_object.set_parent(new_account.account)
-                        await self.load_data()
-                        next_row = await self.get_next_row_matching(
-                            0, affected_object.account, ("account",)
-                        )
-                    if next_row is not None:
-                        self.table_widget.selection_position = TablePosition(
-                            "account", next_row
-                        )
-                case "user":
-                    await affected_object.set_new_username(new_value)
-                case "CPUs":
-                    affected_object.max_cpus = new_value
-                    await affected_object.save()
-                case "GPUs":
-                    affected_object.max_gpus = new_value
-                    await affected_object.save()
-                case "Timelimit":
-                    if new_value is None:
-                        new_value = "-1"
-                    affected_object.grp_wall = new_value
-                    await affected_object.save()
-                case unknown_name:
-                    raise AttributeError(f"Can't update column {unknown_name}")
-            await self.refresh()
-        except (SlurmAccountManagerError, SlurmObjectException) as error:
-            await self.app.display_error(error)
 
-
-class JobListModel(InteractiveTableModel):
+class JobListModel(InteractiveTableModel[Job]):
     title = "Jobs"
 
-    def __init__(self, app: App, table_widget: InteractiveTable):
-        super().__init__(app, table_widget)
+    def __init__(self):
+        super().__init__()
         self._columns: Mapping[str, Mapping[str, Any]] = {
             "Job ID": {"ratio": 2, "no_wrap": True},
             "Job Name": {"justify": "center", "ratio": 3, "no_wrap": True},
@@ -364,47 +237,6 @@ class JobListModel(InteractiveTableModel):
             "Node": {"justify": "right", "ratio": 1, "no_wrap": True},
             "Runtime": {"justify": "right", "ratio": 2, "no_wrap": True},
         }
-
-        self.bind("ctrl+d", "run_on_current_selection('cancel', True)", "Cancel Job")
-        self.bind("ctrl+x", "run_on_current_selection('kill', True)", "Kill Job")
-        self.bind("ctrl+p", "run_on_current_selection('hold', False)", "Put on Hold")
-        self.bind(
-            "ctrl+r", "run_on_current_selection('release', False)", "Release Hold"
-        )
-
-    async def action_run_on_current_selection(
-        self, action_name: str, needs_confirmation: bool
-    ):
-        try:
-            current_selection = self.table_widget.selection_position
-            selected_job = self._tree_list[current_selection.row]
-        except (AttributeError, IndexError):
-            return await self.app.display_error("No Job selected")
-
-        if needs_confirmation:
-            return await self.app.confirm(
-                f'Do you really want to {action_name} the Job "{selected_job.job_name}" ({selected_job.job_id_with_array})',
-                f"model.{action_name}_confirmed('{current_selection.column}', {current_selection.row})",
-            )
-
-        try:
-            action = getattr(selected_job, action_name)
-            await action()
-        except (SlurmControlError, SlurmObjectException) as error:
-            await self.app.display_error(error)
-        await self.refresh()
-
-    async def action_kill_confirmed(
-        self, _: str, row: int, response: str, is_confirmed: bool
-    ):
-        if is_confirmed:
-            await self._tree_list[row].kill()
-
-    async def action_cancel_confirmed(
-        self, _: str, row: int, response: str, is_confirmed: bool
-    ):
-        if is_confirmed:
-            await self._tree_list[row].cancel()
 
     async def load_data(self):
         unordered_jobs = await Job.all()
@@ -431,6 +263,9 @@ class JobListModel(InteractiveTableModel):
 
     def get_column_kwargs(self, column_name: str) -> Mapping[str, Any]:
         return self._columns.get(column_name, {})
+
+    def get_data_object_for_row(self, row: int):
+        return self._tree_list[row]
 
     async def get_cell(self, position: TablePosition) -> str | None:
         tree_node = self._job_tree[position.row]
@@ -482,29 +317,11 @@ class JobListModel(InteractiveTableModel):
             case unknown_name:
                 raise AttributeError(f"Unknown column: {unknown_name}")
 
-    async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
-        affected_object = self._tree_list[position.row]
-        try:
-            match (position.column):
-                case "CPUs":
-                    await affected_object.set_cpus(new_value)
-                case "GPUs":
-                    await affected_object.set_gpus(new_value)
-                case "Timelimit":
-                    affected_object.time_limit = new_value
-                    await affected_object.save()
-                case unknown_name:
-                    raise AttributeError(f"Don't know how to change {unknown_name}")
-            await self.refresh()
-        except (SlurmControlError, SlurmObjectException) as error:
-            await self.app.display_error(error)
 
-
-class NodeListModel(InteractiveTableModel):
+class NodeListModel(InteractiveTableModel[Node]):
     title = "Nodes"
 
-    def __init__(self, app: App, table_widget: InteractiveTable):
-        super().__init__(app, table_widget)
+    def __init__(self):
         self._columns: Mapping[str, Mapping[str, Any]] = {
             "Node Name": {"ratio": 1, "no_wrap": True},
             "State": {"ratio": 1, "no_wrap": True},
@@ -512,47 +329,6 @@ class NodeListModel(InteractiveTableModel):
             "GPU Load": {"justify": "center", "ratio": 2, "no_wrap": True},
             "Uptime": {"justify": "right", "ratio": 1, "no_wrap": True},
         }
-        self.bind("ctrl+r", "prompt_reboot_reason_selected_node(False)", "Reboot Node")
-        self.bind("ctrl+x", "prompt_reboot_reason_selected_node(True)", "Force Reboot")
-
-    async def prompt_for_reason(self, target_node: str, target_state: str):
-        await self.app.prompt(
-            f"Specify a reason for the new {target_state} state",
-            f"model.set_node_state('{target_node}', '{target_state}')",
-        )
-
-    async def action_prompt_reboot_reason_selected_node(self, force: bool):
-        try:
-            current_selection = self.table_widget.selection_position
-            selected_node = self._data[current_selection.row]
-        except (AttributeError, IndexError):
-            return await self.app.display_error("No Node selected")
-
-        return await self.app.prompt(
-            f'Specify the Reboot reason for "{selected_node.node_name}"',
-            f"model.reboot_node({current_selection.row}, {force})",
-        )
-
-    async def action_reboot_node(
-        self, row: int, force: bool, reason: str, confirmed: bool
-    ):
-        if not confirmed:
-            return
-        try:
-            node_to_reboot = self._data[row]
-            await node_to_reboot.reboot(reason, force)
-        except (SlurmControlError, SlurmObjectException) as error:
-            await self.app.display_error(error)
-
-    async def action_set_node_state(
-        self, target_node: str, target_state: str, reason: str, confirmed: bool
-    ):
-        if confirmed:
-            try:
-                node_to_update = Node(node_name=target_node)
-                await node_to_update.set_state(target_state, reason)
-            except (SlurmControlError, SlurmObjectException) as error:
-                await self.app.display_error(error)
 
     async def load_data(self):
         self._data = await Node.all()
@@ -565,6 +341,9 @@ class NodeListModel(InteractiveTableModel):
 
     def get_column_kwargs(self, column_name: str) -> Mapping[str, Any]:
         return self._columns.get(column_name, {})
+
+    def get_data_object_for_row(self, row: int):
+        return self._data[row]
 
     async def get_cell(self, position: TablePosition) -> str | None:
         row_object = self._data[position.row]
@@ -619,21 +398,3 @@ class NodeListModel(InteractiveTableModel):
                 return EditableChoiceTableCell, {"choices": Node.STATES}
             case unknown_name:
                 raise AttributeError(f"Unknown column: {unknown_name}")
-
-    async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
-        affected_object = self._data[position.row]
-        try:
-            match (position.column):
-                case "State":
-                    if new_value in ("DOWN", "DRAIN"):
-                        return await self.prompt_for_reason(
-                            affected_object.node_name, new_value
-                        )
-                    else:
-                        await affected_object.set_state(new_value)
-                case unknown_name:
-                    raise AttributeError(f"Don't know how to change {unknown_name}")
-            await self.refresh()
-
-        except (SlurmControlError, SlurmObjectException) as error:
-            await self.app.display_error(error)

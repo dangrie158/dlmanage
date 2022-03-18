@@ -6,6 +6,7 @@ from typing import (
     Any,
     ClassVar,
     Dict,
+    Generic,
     Iterable,
     List,
     Mapping,
@@ -14,6 +15,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    TypeVar,
 )
 from abc import ABC, abstractmethod
 
@@ -31,11 +33,11 @@ from rich.columns import Columns
 
 from textual import events
 from textual.app import App
+from textual.binding import Bindings
 from textual.reactive import Reactive
 from textual.widget import Widget
 from textual.message import Message, MessageTarget
 from textual.messages import CursorMove
-from textual.binding import Bindings
 
 TablePosition = NamedTuple("TablePosition", (("column", str), ("row", int)))
 
@@ -44,7 +46,7 @@ class TableTheme:
     cell = Style(color="gray62")
     text_cell = Style(color="white")
     int_cell = Style(color="green")
-    choice_cell = Style(color="green3")
+    choice_cell = Style(color="green")
     hovered_cell = Style(bold=True)
     hovered_editable_cell = Style(bold=True, underline=True)
     selected_row = Style(bgcolor="gray19")
@@ -466,13 +468,11 @@ class CellFinishedEditing(Message):
         yield "new_content", self.new_content
 
 
-class InteractiveTableModel(ABC, Bindings):
-    title: ClassVar[str]
+ModelEntryType = TypeVar("ModelEntryType")
 
-    def __init__(self, app: App, table_widget: InteractiveTable) -> None:
-        super().__init__()
-        self.app = app
-        self.table_widget = table_widget
+
+class InteractiveTableModel(ABC, Generic[ModelEntryType]):
+    title: ClassVar[str]
 
     @abstractmethod
     async def load_data(self):
@@ -486,16 +486,8 @@ class InteractiveTableModel(ABC, Bindings):
     def get_num_rows(self) -> int:
         ...
 
-    async def refresh(self):
-        await self.load_data()
-        await self.table_widget.refresh_data_from_model()
-        self.table_widget.refresh()
-        # we need to manually trigger the select_position watcher to reforcus the newly created cell
-        old_position = self.table_widget.selection_position
-        self.table_widget.watch_selection_position(None, old_position)
-
     @abstractmethod
-    async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
+    def get_data_object_for_row(self, row: int) -> ModelEntryType:
         ...
 
     def get_column_kwargs(self, column_name: str) -> Mapping[str, Any]:
@@ -587,11 +579,13 @@ class InteractiveTable(Widget):
     def __init__(
         self,
         *,
+        controller: InteractiveTableController,
         name: str | None = None,
         padding: PaddingDimensions = (1, 1),
         theme: TableTheme = TableTheme(),
     ) -> None:
         self.theme = theme
+        self.controller = controller
 
         self.cells: Dict[TablePosition, TableCell] = {}
         self.columns: Sequence[str] = []
@@ -605,15 +599,8 @@ class InteractiveTable(Widget):
         super().__init__(name=name)
         self.padding = padding
 
-    async def watch_model(self, new_model: InteractiveTableModel):
-        self.is_loading = True
-        await self.refresh_data_from_model()
-        self.is_loading = False
-
     async def refresh_data_from_model(self):
         with self._refresh_data_lock:
-            # TODO: handle removing of old data
-            #       and updating only cell content instead of the complete object
             self.num_rows = self.model.get_num_rows()
             self.columns = self.model.get_columns()
             for column in self.columns:
@@ -781,4 +768,51 @@ class InteractiveTable(Widget):
         self.is_in_edit_mode = False
 
     async def handle_cell_edited(self, event: CellEdited):
-        await self.model.on_cell_update(event.position, event.new_content)
+        await self.controller.on_cell_update(event.position, event.new_content)
+
+
+class InteractiveTableController(ABC, Bindings):
+    model_class: ClassVar[Type[InteractiveTableModel]]
+    view_class: Type[InteractiveTable] = InteractiveTable
+    theme_class: Type[TableTheme] = TableTheme
+    view: InteractiveTable
+    model: InteractiveTableModel
+
+    def __init__(self, app: App) -> None:
+        super().__init__()
+        self.app = app
+        self.model = self.model_class()
+        self.view = self.view_class(
+            name=f"{self.model.title} Controller",
+            controller=self,
+            theme=self.theme_class(),
+        )
+        self.view.model = self.model
+
+    async def initialize(self):
+        self.view.is_loading = True
+        await self.refresh()
+        self.view.is_loading = False
+        # set a timer to always keep the current model updated
+        self.interval_timer = self.app.set_interval(
+            1.0, self.refresh_model_timer_callback
+        )
+
+    async def uninitialize(self):
+        await self.interval_timer.stop()
+
+    async def refresh_model_timer_callback(self):
+        if self.model is not None and not self.view.is_in_edit_mode:
+            await self.refresh()
+
+    async def refresh(self):
+        await self.model.load_data()
+        await self.view.refresh_data_from_model()
+        self.view.refresh()
+        # we need to manually trigger the select_position watcher to reforcus the newly created cell
+        old_position = self.view.selection_position
+        self.view.watch_selection_position(None, old_position)
+
+    @abstractmethod
+    async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
+        ...
