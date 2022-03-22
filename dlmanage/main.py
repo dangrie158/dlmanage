@@ -1,7 +1,9 @@
 from __future__ import annotations
 from contextlib import suppress
+from pathlib import Path
 from rich.style import Style, NULL_STYLE
 
+from rich.text import Text
 from textual import events
 from textual.app import App
 from textual.widgets import Header, ScrollView, TreeControl, TreeClick
@@ -9,7 +11,7 @@ from textual.widget import Widget
 from textual import actions
 
 from dlmanage.slurmbridge.cliobject import SlurmObjectException
-from dlmanage.slurmbridge.objects import Account, User, Node
+from dlmanage.slurmbridge.objects import Account, Job, User, Node
 from dlmanage.slurmbridge.scontrol import SlurmControlError
 from dlmanage.slurmbridge.sacctmgr import SlurmAccountManagerError
 
@@ -42,6 +44,22 @@ class AppTheme(TableTheme):
     blurred_border_style = Style(color="gray62")
 
 
+class LogView(Widget):
+    def __init__(self, file: Path, name: str | None = None) -> None:
+        super().__init__(name)
+        self.file = file.open("r")
+        self.lines = self.file.readlines()
+
+    def refresh(self, repaint: bool = True, layout: bool = False) -> None:
+        while line := self.file.readline():
+            self.lines.append(line)
+
+        return super().refresh(repaint, layout)
+
+    def render(self):
+        return Text("\n".join(self.lines[-30:]))
+
+
 class SlurmControl(App):
     theme = AppTheme()
     controller: InteractiveTableController | None = None
@@ -66,10 +84,10 @@ class SlurmControl(App):
         self.sidebar_content.can_focus = True
 
         await model_tree.root.add(
-            AssociationTableController.model_class.title, AssociationTableController
+            JobTableController.model_class.title, JobTableController
         )
         await model_tree.root.add(
-            JobTableController.model_class.title, JobTableController
+            AssociationTableController.model_class.title, AssociationTableController
         )
         await model_tree.root.add(
             NodeTableController.model_class.title, NodeTableController
@@ -83,7 +101,7 @@ class SlurmControl(App):
 
         # initially set the focus to the sidebar so we can steal it after loading the model
         await self.set_focus(self.sidebar_content)
-        await self.switch_controller(AssociationTableController(self))
+        await self.switch_controller(JobTableController(self))
 
     async def set_focus(self, widget: Widget | None) -> None:
         if self.focused == widget:
@@ -143,26 +161,33 @@ class SlurmControl(App):
             controller = controller_class(self)
             await self.switch_controller(controller)
 
-    async def prompt(self, message: str, response_action: str):
+    async def focus_footer(self):
         await self.set_focus(self.footer)
-        self.controller.view.can_focus = False
+        if self.controller is not None:
+            self.controller.view.can_focus = False
         self.sidebar_content.can_focus = False
+
+    async def blur_footer(self):
+        await self.set_focus(self.controller.view)
+        self.controller.view.can_focus = True
+        self.sidebar_content.can_focus = True
+
+    async def prompt(self, message: str, response_action: str):
         self.current_response_action = response_action
+        await self.focus_footer()
         self.footer.prompt(message)
 
     async def confirm(self, message: str, response_action: str):
-        await self.set_focus(self.footer)
-        self.controller.view.can_focus = False
-        self.sidebar_content.can_focus = False
         self.current_response_action = response_action
+        await self.focus_footer()
         self.footer.confirm(message)
 
     async def handle_prompt_response(self, message: PromptResponse):
         if self.current_response_action is None:
             raise AssertionError("unexpected prompt response")
-        self.controller.view.can_focus = True
-        self.sidebar_content.can_focus = True
-        await self.set_focus(self.controller.view)
+
+        await self.blur_footer()
+
         action_name, fixed_args = actions.parse(self.current_response_action)
         response_args = (message.response, message.confirmed)
         action_args = ", ".join([repr(arg) for arg in fixed_args + response_args])
@@ -171,15 +196,11 @@ class SlurmControl(App):
         self.current_response_action = None
 
     async def display_error(self, error: Exception | str):
-        await self.set_focus(self.footer)
-        self.controller.view.can_focus = False
-        self.sidebar_content.can_focus = False
+        await self.focus_footer()
         self.footer.show_error(str(error))
 
     async def handle_error_dismissed(self, message: ErrorDismissed):
-        self.controller.view.can_focus = True
-        self.sidebar_content.can_focus = True
-        await self.set_focus(self.controller.view)
+        await self.blur_footer()
 
 
 def main():
@@ -246,7 +267,9 @@ class AssociationTableController(InteractiveTableController):
                 initial_account_name = initial_account.account or "root"
                 await User.create(user=username, account=initial_account_name)
                 await self.refresh()
-                next_row = await self.get_next_row_matching(0, username, ("user",))
+                next_row = await self.model.get_next_row_matching(
+                    0, username, ("user",)
+                )
                 if next_row:
                     self.view.selection_position = TablePosition(column, next_row)
             except (SlurmAccountManagerError, SlurmObjectException) as error:
@@ -279,6 +302,11 @@ class AssociationTableController(InteractiveTableController):
 
     async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
         affected_object = self.model.get_data_object_for_row(position.row)
+
+        # if we update an account we can potentially update many associations
+        allow_multiple_affected = (
+            True if isinstance(affected_object, Account) else False
+        )
         try:
             match position.column:
                 case "account":
@@ -287,13 +315,13 @@ class AssociationTableController(InteractiveTableController):
                     if isinstance(affected_object, User):
                         await affected_object.set_account(new_account)
                         await self.model.load_data()
-                        next_row = await self.get_next_row_matching(
+                        next_row = await self.model.get_next_row_matching(
                             0, affected_object.user, ("user",)
                         )
                     else:
                         await affected_object.set_parent(new_account.account)
                         await self.model.load_data()
-                        next_row = await self.get_next_row_matching(
+                        next_row = await self.model.get_next_row_matching(
                             0, affected_object.account, ("account",)
                         )
                     if next_row is not None:
@@ -304,15 +332,15 @@ class AssociationTableController(InteractiveTableController):
                     await affected_object.set_new_username(new_value)
                 case "CPUs":
                     affected_object.max_cpus = new_value
-                    await affected_object.save()
+                    await affected_object.save(allow_multiple_affected)
                 case "GPUs":
                     affected_object.max_gpus = new_value
-                    await affected_object.save()
+                    await affected_object.save(allow_multiple_affected)
                 case "Timelimit":
                     if new_value is None:
                         new_value = "-1"
                     affected_object.grp_wall = new_value
-                    await affected_object.save()
+                    await affected_object.save(allow_multiple_affected)
                 case unknown_name:
                     raise AttributeError(f"Can't update column {unknown_name}")
             await self.refresh()
@@ -320,11 +348,11 @@ class AssociationTableController(InteractiveTableController):
             await self.app.display_error(error)
 
 
-class JobTableController(InteractiveTableController):
+class JobTableController(InteractiveTableController[Job]):
     model_class = JobListModel
     theme_class = AppTheme
 
-    def __init__(self, app: App):
+    def __init__(self, app: SlurmControl):
         super().__init__(app)
 
         self.bind("ctrl+d", "run_on_current_selection('cancel', True)", "Cancel Job")
@@ -384,6 +412,12 @@ class JobTableController(InteractiveTableController):
             await self.refresh()
         except (SlurmControlError, SlurmObjectException) as error:
             await self.app.display_error(error)
+
+    async def on_cell_clicked(self, position: TablePosition) -> None:
+        row_object = self.model.get_data_object_for_row(position.row)
+        if row_object.std_out is None:
+            return
+        await self.app.main_content_container.update(LogView(Path(row_object.std_out)))
 
 
 class NodeTableController(InteractiveTableController):

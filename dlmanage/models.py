@@ -9,6 +9,7 @@ from textual.app import App
 from dlmanage.slurmbridge.scontrol import SlurmControlError
 
 from dlmanage.widgets.interactive_table import (
+    ClickableTableCell,
     EditableChoiceTableCell,
     EditableIntTableCell,
     EditableTableCell,
@@ -216,7 +217,7 @@ class AssociationListModel(InteractiveTableModel[User | Account]):
             case "Home Directory":
                 return TableCell, {
                     "can_focus": False,
-                    "placeholder": "<home dir does not exist>",
+                    "placeholder": "<not found>",
                 }
             case unknown_name:
                 raise AttributeError(f"Unknown column: {unknown_name}")
@@ -234,6 +235,7 @@ class JobListModel(InteractiveTableModel[Job]):
             "GPUs": {"justify": "right", "ratio": 1, "no_wrap": True},
             "Memory": {"justify": "right", "ratio": 1, "no_wrap": True},
             "Timelimit": {"justify": "right", "ratio": 2, "no_wrap": True},
+            "Output": {"justify": "center", "ratio": 1, "no_wrap": True},
             "Node": {"justify": "right", "ratio": 1, "no_wrap": True},
             "Runtime": {"justify": "right", "ratio": 2, "no_wrap": True},
         }
@@ -286,6 +288,8 @@ class JobListModel(InteractiveTableModel[Job]):
                 return row_object.memory
             case "Timelimit":
                 return row_object.time_limit
+            case "Output":
+                return "view" if row_object.std_out is not None else None
             case "Node":
                 return row_object.node_list or ""
             case "Runtime":
@@ -314,6 +318,8 @@ class JobListModel(InteractiveTableModel[Job]):
                 return TableCell, {"placeholder": "", "can_focus": False}
             case "Timelimit":
                 return EditableTableCell, {}
+            case "Output":
+                return ClickableTableCell, {"placeholder": "n/a"}
             case unknown_name:
                 raise AttributeError(f"Unknown column: {unknown_name}")
 

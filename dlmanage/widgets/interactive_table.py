@@ -283,6 +283,13 @@ class EditableTableCell(TableCell):
                     self.input_key(other)
 
 
+class ClickableTableCell(EditableTableCell):
+    async def on_key(self, event: events.Key) -> None:
+        event.stop()
+        if event.key == "enter":
+            await self.emit(CellClicked(self, self.position))
+
+
 class EditableIntTableCell(EditableTableCell):
     def __init__(
         self,
@@ -455,6 +462,16 @@ class CellEdited(Message):
     def __rich_repr__(self) -> rich.repr.Result:
         yield "position", self.position
         yield "new_content", self.new_content
+
+
+@rich.repr.auto
+class CellClicked(Message):
+    def __init__(self, sender: MessageTarget, position: TablePosition) -> None:
+        self.position = position
+        super().__init__(sender)
+
+    def __rich_repr__(self) -> rich.repr.Result:
+        yield "position", self.position
 
 
 @rich.repr.auto
@@ -760,6 +777,17 @@ class InteractiveTable(Widget):
                         await cell.begin_editing()
                         self.refresh()
                         self.is_in_edit_mode = True
+            case "escape":
+                # escape will remove the focus
+                if self.selection_position is not None:
+                    if self.selection_position.column != "":
+                        # first from the selected cell to the whole row
+                        self.selection_position = TablePosition(
+                            "", self.selection_position.row
+                        )
+                    else:
+                        # if pressed again, remove the row selection
+                        self.selection_position = None
 
     async def handle_cell_started_editing(self, event: CellFinishedEditing):
         self.is_in_edit_mode = True
@@ -770,13 +798,16 @@ class InteractiveTable(Widget):
     async def handle_cell_edited(self, event: CellEdited):
         await self.controller.on_cell_update(event.position, event.new_content)
 
+    async def handle_cell_clicked(self, event: CellEdited):
+        await self.controller.on_cell_clicked(event.position)
 
-class InteractiveTableController(ABC, Bindings):
+
+class InteractiveTableController(ABC, Bindings, Generic[ModelEntryType]):
     model_class: ClassVar[Type[InteractiveTableModel]]
     view_class: Type[InteractiveTable] = InteractiveTable
     theme_class: Type[TableTheme] = TableTheme
     view: InteractiveTable
-    model: InteractiveTableModel
+    model: InteractiveTableModel[ModelEntryType]
 
     def __init__(self, app: App) -> None:
         super().__init__()
@@ -813,6 +844,8 @@ class InteractiveTableController(ABC, Bindings):
         old_position = self.view.selection_position
         self.view.watch_selection_position(None, old_position)
 
-    @abstractmethod
     async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
-        ...
+        pass
+
+    async def on_cell_clicked(self, position: TablePosition) -> None:
+        pass

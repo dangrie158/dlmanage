@@ -220,7 +220,7 @@ class WritableSlurmAccountManagerObject(
                 f"Failed to create new {cls.__name__}. Maybe the object already existed?",
             )
 
-    async def save(self) -> bool:
+    async def save(self, allow_multiple_affected=False) -> bool:
         created = False
         updates, filters = self._to_query()
 
@@ -229,8 +229,8 @@ class WritableSlurmAccountManagerObject(
             # the object was not yet present in the db, create a new one
             await self._scattmgr_write("create", updates | filters, {})
             created = True
-        elif len(updated_keys) > 1:
-            raise AssertionError(
+        elif len(updated_keys) > 1 and not allow_multiple_affected:
+            raise SlurmAccountManagerError(
                 f"Modified more than a single Object!. Modified keys: {updated_keys}"
             )
 
@@ -243,7 +243,7 @@ class WritableSlurmAccountManagerObject(
 
         updated_keys = await self._scattmgr_write("delete", {}, filters)
         if len(updated_keys) > 1:
-            raise AssertionError(
+            raise SlurmAccountManagerError(
                 f"Deleted more than a single Object!. Deleted keys: {updated_keys}"
             )
 

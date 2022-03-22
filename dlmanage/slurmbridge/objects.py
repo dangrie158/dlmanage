@@ -219,8 +219,8 @@ class Job(SlurmControlObject["Job"], SlurmCancelObject):
     account: str = field(repr=False, read_only=True)
     gres: Optional[str] = field(repr=False, write_only=True, default=None)
     num_cpus: Optional[str] = field(repr=False, write_only=True, default=None)
-    std_out: Optional[str] = field(repr=False, write_only=True, default=None)
-    std_err: Optional[str] = field(repr=False, write_only=True, default=None)
+    std_out: Optional[str] = field(repr=False, read_only=True, default=None)
+    std_err: Optional[str] = field(repr=False, read_only=True, default=None)
     array_task_id: Optional[str] = field(repr=False, read_only=True, default=None)
     reason: Optional[str] = field(repr=False, read_only=True, default=None)
 
