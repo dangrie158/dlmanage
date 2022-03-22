@@ -16,12 +16,7 @@ from dlmanage.slurmbridge.scontrol import SlurmControlError
 from dlmanage.slurmbridge.sacctmgr import SlurmAccountManagerError
 
 
-from dlmanage.widgets import (
-    Footer,
-    TableTheme,
-    LogView,
-    JumpableScrollView
-)
+from dlmanage.widgets import Footer, TableTheme, LogView, JumpableScrollView
 
 from dlmanage.models import AssociationListModel, JobListModel, NodeListModel
 from dlmanage.widgets.footer import ErrorDismissed, PromptResponse
@@ -389,6 +384,7 @@ class JobTableController(InteractiveTableController[Job]):
         await self.app.main_content_container.update(self.view)
         await self.app.unbind_controller(self)
         self.keys = self.old_binding
+        self.app.header.sub_title = self.model.title
         await self.app.bind_controller(self)
 
     async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
@@ -422,6 +418,7 @@ class JobTableController(InteractiveTableController[Job]):
         self.old_binding = copy(self.keys)
         self.keys.clear()
         self.bind("escape", "close_log_view()", "Return to Joblist", "esc")
+        self.app.header.sub_title = f"Logs for {row_object.job_name} (JobID: {row_object.job_id_with_array})"
         await self.app.bind_controller(self)
         await self.app.main_content_container.update(log_view)
 
