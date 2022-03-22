@@ -10,6 +10,8 @@ from .interactive_table import (
     CellFinishedEditing,
 )
 from .footer import Footer
+from .scroll_view import JumpableScrollView
+from .log_view import LogView
 
 __all__ = [
     "Footer",
@@ -22,4 +24,6 @@ __all__ = [
     "EditableChoiceTableCell",
     "TableTheme",
     "CellFinishedEditing",
+    "JumpableScrollView",
+    "LogView",
 ]

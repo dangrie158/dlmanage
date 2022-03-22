@@ -1,5 +1,6 @@
 from collections import defaultdict
 from contextlib import suppress
+from os import path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple, Type
 from io import StringIO
 
@@ -289,7 +290,10 @@ class JobListModel(InteractiveTableModel[Job]):
             case "Timelimit":
                 return row_object.time_limit
             case "Output":
-                return "view" if row_object.std_out is not None else None
+                can_be_viewed = row_object.std_out is not None and path.exists(
+                    row_object.std_out
+                )
+                return "view" if can_be_viewed else None
             case "Node":
                 return row_object.node_list or ""
             case "Runtime":
@@ -319,7 +323,11 @@ class JobListModel(InteractiveTableModel[Job]):
             case "Timelimit":
                 return EditableTableCell, {}
             case "Output":
-                return ClickableTableCell, {"placeholder": "n/a"}
+                can_be_viewed = row_object.std_out is not None and path.exists(
+                    row_object.std_out
+                )
+                cell_class = ClickableTableCell if can_be_viewed else TableCell
+                return cell_class, {"placeholder": "n/a"}
             case unknown_name:
                 raise AttributeError(f"Unknown column: {unknown_name}")
 

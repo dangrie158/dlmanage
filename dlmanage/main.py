@@ -1,12 +1,12 @@
 from __future__ import annotations
 from contextlib import suppress
+from copy import copy
 from pathlib import Path
 from rich.style import Style, NULL_STYLE
 
-from rich.text import Text
 from textual import events
 from textual.app import App
-from textual.widgets import Header, ScrollView, TreeControl, TreeClick
+from textual.widgets import Header, TreeControl, TreeClick
 from textual.widget import Widget
 from textual import actions
 
@@ -19,6 +19,8 @@ from dlmanage.slurmbridge.sacctmgr import SlurmAccountManagerError
 from dlmanage.widgets import (
     Footer,
     TableTheme,
+    LogView,
+    JumpableScrollView
 )
 
 from dlmanage.models import AssociationListModel, JobListModel, NodeListModel
@@ -44,22 +46,6 @@ class AppTheme(TableTheme):
     blurred_border_style = Style(color="gray62")
 
 
-class LogView(Widget):
-    def __init__(self, file: Path, name: str | None = None) -> None:
-        super().__init__(name)
-        self.file = file.open("r")
-        self.lines = self.file.readlines()
-
-    def refresh(self, repaint: bool = True, layout: bool = False) -> None:
-        while line := self.file.readline():
-            self.lines.append(line)
-
-        return super().refresh(repaint, layout)
-
-    def render(self):
-        return Text("\n".join(self.lines[-30:]))
-
-
 class SlurmControl(App):
     theme = AppTheme()
     controller: InteractiveTableController | None = None
@@ -69,14 +55,13 @@ class SlurmControl(App):
     async def on_load(self, event: events.Load) -> None:
         await self.bind("q", "quit", "Quit")
         await self.bind("ctrl+i", "switch_focus", "Switch Focus", show=False)
-        await self.bind("enter", "edit", "Edit")
 
     async def on_mount(self, event: events.Mount) -> None:
         self.header = Header(clock=True, tall=True, style=self.theme.header)
         self.header.disable_messages(events.Click)
         self.footer = Footer(style=self.theme.header)
 
-        self.main_content_container = ScrollView()
+        self.main_content_container = JumpableScrollView(fluid=False)
 
         self.sidebar_content = model_tree = TreeControl("Models", None)
         self.sidebar_content._tree.hide_root = True
@@ -119,37 +104,40 @@ class SlurmControl(App):
         else:
             await self.sidebar_content.focus()
 
-    async def switch_controller(self, controller: InteractiveTableController) -> None:
+    async def bind_controller(self, controller: InteractiveTableController):
+        self._action_targets.add("controller")
+        for binding in controller.keys.values():
+            await self.bind(
+                keys=binding.key,
+                action=f"controller.{binding.action}",
+                description=binding.description,
+                key_display=binding.key_display,
+            )
+        self.footer.refresh()
 
+    async def unbind_controller(self, controller: InteractiveTableController):
+        for key in controller.keys.keys():
+            del self.bindings.keys[key]
+        self._action_targets.remove("controller")
+        self.footer.refresh()
+
+    async def switch_controller(self, controller: InteractiveTableController) -> None:
         # unregister the bindings from the old model
         if self.controller is not None:
             self.controller.view.is_loading = True
-            for key in self.controller.keys.keys():
-                del self.bindings.keys[key]
+            await self.unbind_controller(self.controller)
             await self.controller.uninitialize()
 
         self.controller = controller
         # register the new model bindings
         if controller is not None:
             self.header.sub_title = self.controller.model_class.title
-
-            self._action_targets.add("controller")
-            for binding in self.controller.keys.values():
-                await self.bind(
-                    keys=binding.key,
-                    action=f"controller.{binding.action}",
-                    description=binding.description,
-                    key_display=binding.key_display,
-                )
-
+            await self.bind_controller(controller)
             await self.controller.initialize()
             await self.main_content_container.update(self.controller.view)
             await self.set_focus(self.main_content_container)
             self.controller.view.is_loading = False
             self.footer.refresh()
-
-        else:
-            self._action_targets.remove("controller")
 
     async def handle_tree_click(self, message: TreeClick) -> None:
         if not self.sidebar_content.can_focus:
@@ -396,6 +384,13 @@ class JobTableController(InteractiveTableController[Job]):
         if is_confirmed:
             await self.model.get_data_object_for_row(row).cancel()
 
+    async def action_close_log_view(self):
+        self.view.can_focus = True
+        await self.app.main_content_container.update(self.view)
+        await self.app.unbind_controller(self)
+        self.keys = self.old_binding
+        await self.app.bind_controller(self)
+
     async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
         affected_object = self.model.get_data_object_for_row(position.row)
         try:
@@ -416,8 +411,19 @@ class JobTableController(InteractiveTableController[Job]):
     async def on_cell_clicked(self, position: TablePosition) -> None:
         row_object = self.model.get_data_object_for_row(position.row)
         if row_object.std_out is None:
-            return
-        await self.app.main_content_container.update(LogView(Path(row_object.std_out)))
+            return await self.app.display_error(FileNotFoundError("File not found"))
+        try:
+            log_view = LogView(Path(row_object.std_out))
+        except Exception as error:
+            return await self.app.display_error(str(error))
+
+        self.view.can_focus = False
+        await self.app.unbind_controller(self)
+        self.old_binding = copy(self.keys)
+        self.keys.clear()
+        self.bind("escape", "close_log_view()", "Return to Joblist", "esc")
+        await self.app.bind_controller(self)
+        await self.app.main_content_container.update(log_view)
 
 
 class NodeTableController(InteractiveTableController):

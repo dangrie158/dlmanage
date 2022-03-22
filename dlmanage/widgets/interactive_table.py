@@ -38,6 +38,7 @@ from textual.reactive import Reactive
 from textual.widget import Widget
 from textual.message import Message, MessageTarget
 from textual.messages import CursorMove
+from textual.message_pump import NoParent
 
 TablePosition = NamedTuple("TablePosition", (("column", str), ("row", int)))
 
@@ -285,8 +286,8 @@ class EditableTableCell(TableCell):
 
 class ClickableTableCell(EditableTableCell):
     async def on_key(self, event: events.Key) -> None:
-        event.stop()
         if event.key == "enter":
+            event.stop()
             await self.emit(CellClicked(self, self.position))
 
 
@@ -840,9 +841,19 @@ class InteractiveTableController(ABC, Bindings, Generic[ModelEntryType]):
         await self.model.load_data()
         await self.view.refresh_data_from_model()
         self.view.refresh()
+
+        try:
+            self.view.parent
+        except NoParent:
+            return
+
         # we need to manually trigger the select_position watcher to reforcus the newly created cell
+        # but we need to disable CursorMove events on the parent before otherwise we will always
+        # move the current scroll position
+        self.view.parent.disable_messages(CursorMove)
         old_position = self.view.selection_position
-        self.view.watch_selection_position(None, old_position)
+        self.view.watch_selection_position(old_position, old_position)
+        self.view._parent.enable_messages(CursorMove)
 
     async def on_cell_update(self, position: TablePosition, new_value: str) -> None:
         pass
