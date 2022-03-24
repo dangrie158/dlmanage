@@ -24,7 +24,6 @@ from rich.style import Style, NULL_STYLE
 from rich.table import Table
 from rich.text import Text
 from rich.panel import Panel
-from rich.padding import PaddingDimensions
 from rich.console import RenderableType
 from rich.status import Status
 from rich.align import Align
@@ -32,6 +31,7 @@ from rich.progress_bar import ProgressBar
 from rich.columns import Columns
 
 from textual import events
+from textual.geometry import Spacing
 from textual.app import App
 from textual.binding import Bindings
 from textual.reactive import Reactive
@@ -483,10 +483,10 @@ class CellFinishedEditing(Message):
 
     def __rich_repr__(self) -> rich.repr.Result:
         yield "position", self.position
-        yield "new_content", self.new_content
 
 
 ModelEntryType = TypeVar("ModelEntryType")
+AppType = TypeVar("AppType", bound=App)
 
 
 class InteractiveTableModel(ABC, Generic[ModelEntryType]):
@@ -589,7 +589,6 @@ class InteractiveTable(Widget):
     selection_position: Reactive[Optional[TablePosition]] = Reactive(None, layout=True)
     hover_position: Reactive[Optional[TablePosition]] = Reactive(None, layout=True)
     is_in_edit_mode: Reactive[bool] = Reactive(False)
-    model: Reactive[Optional[InteractiveTableModel]] = Reactive(None, layout=True)
     is_loading: Reactive[bool] = Reactive(False)
 
     _refresh_data_lock: threading.Lock = threading.Lock()
@@ -598,12 +597,14 @@ class InteractiveTable(Widget):
         self,
         *,
         controller: InteractiveTableController,
+        model: InteractiveTableModel,
         name: str | None = None,
-        padding: PaddingDimensions = (1, 1),
+        padding: Spacing = Spacing(1, 1, 1, 1),
         theme: TableTheme = TableTheme(),
     ) -> None:
         self.theme = theme
         self.controller = controller
+        self.model = model
 
         self.cells: Dict[TablePosition, TableCell] = {}
         self.columns: Sequence[str] = []
@@ -694,6 +695,8 @@ class InteractiveTable(Widget):
             self.selection_position = None
             return
 
+        assert isinstance(column, str)
+        assert isinstance(row, int)
         self.selection_position = TablePosition(column, row)
 
     async def on_mouse_move(self, event: events.MouseMove) -> None:
@@ -704,6 +707,8 @@ class InteractiveTable(Widget):
             self.hover_position = None
             return
 
+        assert isinstance(column, str)
+        assert isinstance(row, int)
         self.hover_position = TablePosition(column, row)
 
     async def on_key(self, event: events.Key) -> None:
@@ -803,20 +808,21 @@ class InteractiveTable(Widget):
         await self.controller.on_cell_clicked(event.position)
 
 
-class InteractiveTableController(ABC, Bindings, Generic[ModelEntryType]):
+class InteractiveTableController(ABC, Bindings, Generic[ModelEntryType, AppType]):
     model_class: ClassVar[Type[InteractiveTableModel]]
     view_class: Type[InteractiveTable] = InteractiveTable
     theme_class: Type[TableTheme] = TableTheme
     view: InteractiveTable
     model: InteractiveTableModel[ModelEntryType]
 
-    def __init__(self, app: App) -> None:
+    def __init__(self, app: AppType) -> None:
         super().__init__()
         self.app = app
         self.model = self.model_class()
         self.view = self.view_class(
             name=f"{self.model.title} Controller",
             controller=self,
+            model=self.model,
             theme=self.theme_class(),
         )
         self.view.model = self.model

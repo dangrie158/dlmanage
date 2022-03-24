@@ -2,6 +2,7 @@ from __future__ import annotations
 from contextlib import suppress
 from copy import copy
 from pathlib import Path
+from typing import Type, Union
 from rich.style import Style, NULL_STYLE
 
 from textual import events
@@ -11,7 +12,7 @@ from textual.widget import Widget
 from textual import actions
 
 from dlmanage.slurmbridge.cliobject import SlurmObjectException
-from dlmanage.slurmbridge.objects import Account, Job, User, Node
+from dlmanage.slurmbridge.objects import Account, Association, Job, User, Node
 from dlmanage.slurmbridge.scontrol import SlurmControlError
 from dlmanage.slurmbridge.sacctmgr import SlurmAccountManagerError
 
@@ -58,21 +59,23 @@ class SlurmControl(App):
 
         self.main_content_container = JumpableScrollView(fluid=False)
 
-        self.sidebar_content = model_tree = TreeControl("Models", None)
+        self.sidebar_content: TreeControl[
+            Type[InteractiveTableController] | None
+        ] = TreeControl("Models", None)
         self.sidebar_content._tree.hide_root = True
         self.sidebar_content.border = "round"
         self.sidebar_content.can_focus = True
 
-        await model_tree.root.add(
+        await self.sidebar_content.root.add(
             JobTableController.model_class.title, JobTableController
         )
-        await model_tree.root.add(
+        await self.sidebar_content.root.add(
             AssociationTableController.model_class.title, AssociationTableController
         )
-        await model_tree.root.add(
+        await self.sidebar_content.root.add(
             NodeTableController.model_class.title, NodeTableController
         )
-        await model_tree.root.expand()
+        await self.sidebar_content.root.expand()
 
         await self.view.dock(self.header, edge="top")
         await self.view.dock(self.footer, edge="bottom")
@@ -95,7 +98,7 @@ class SlurmControl(App):
 
     async def action_switch_focus(self):
         if self.sidebar_content == self.focused:
-            await self.main_content.focus()
+            await self.main_content_container.window.widget.focus()
         else:
             await self.sidebar_content.focus()
 
@@ -130,7 +133,7 @@ class SlurmControl(App):
             await self.bind_controller(controller)
             await self.controller.initialize()
             await self.main_content_container.update(self.controller.view)
-            await self.set_focus(self.main_content_container)
+            await self.set_focus(self.main_content_container.window.widget)
             self.controller.view.is_loading = False
             self.footer.refresh()
 
@@ -190,7 +193,9 @@ def main():
     SlurmControl.run(title="Slurm Control")
 
 
-class AssociationTableController(InteractiveTableController):
+class AssociationTableController(
+    InteractiveTableController[Union[User, Account], SlurmControl]
+):
     model_class = AssociationListModel
     theme_class = AppTheme
 
@@ -213,10 +218,16 @@ class AssociationTableController(InteractiveTableController):
         if confirmed:
             # try to find the next account up the hierarchy from the selected
             # row "upwards"
-            parent = self.model.get_data_object_for_row(row)
+            parent: Association | None = self.model.get_data_object_for_row(row)
             while not isinstance(parent, Account):
+                if parent is None:
+                    break
                 parent = parent.parent_object
-            parent_name = parent.account or "root"
+            parent_name = (
+                parent.account
+                if parent is not None and parent.account is not None
+                else "root"
+            )
             try:
                 new_account = await Account.create(account=accountname)
                 with suppress(SlurmObjectException):
@@ -244,10 +255,19 @@ class AssociationTableController(InteractiveTableController):
             try:
                 # try to find the next account up the hierarchy from the selected
                 # row "upwards"
-                initial_account = self.model.get_data_object_for_row(row)
+                initial_account: Association | None = (
+                    self.model.get_data_object_for_row(row)
+                )
                 while not isinstance(initial_account, Account):
+                    if initial_account is None:
+                        break
                     initial_account = initial_account.parent_object
-                initial_account_name = initial_account.account or "root"
+                initial_account_name = (
+                    initial_account.account
+                    if initial_account is not None
+                    and initial_account.account is not None
+                    else "root"
+                )
                 await User.create(user=username, account=initial_account_name)
                 await self.refresh()
                 next_row = await self.model.get_next_row_matching(
@@ -312,6 +332,7 @@ class AssociationTableController(InteractiveTableController):
                             "account", next_row
                         )
                 case "user":
+                    assert isinstance(affected_object, User)
                     await affected_object.set_new_username(new_value)
                 case "CPUs":
                     affected_object.max_cpus = new_value
@@ -331,7 +352,7 @@ class AssociationTableController(InteractiveTableController):
             await self.app.display_error(error)
 
 
-class JobTableController(InteractiveTableController[Job]):
+class JobTableController(InteractiveTableController[Job, SlurmControl]):
     model_class = JobListModel
     theme_class = AppTheme
 
@@ -350,6 +371,8 @@ class JobTableController(InteractiveTableController[Job]):
     ):
         try:
             current_selection = self.view.selection_position
+            if current_selection is None:
+                raise IndexError
             selected_job = self.model.get_data_object_for_row(current_selection.row)
         except (AttributeError, IndexError):
             return await self.app.display_error("No Job selected")
@@ -417,17 +440,19 @@ class JobTableController(InteractiveTableController[Job]):
         await self.app.unbind_controller(self)
         self.old_binding = copy(self.keys)
         self.keys.clear()
-        self.bind("escape", "close_log_view()", "Return to Joblist", "esc")
-        self.app.header.sub_title = f"Logs for {row_object.job_name} (JobID: {row_object.job_id_with_array})"
+        self.bind("escape", "close_log_view()", "Return to Joblist", key_display="esc")
+        self.app.header.sub_title = (
+            f"Logs for {row_object.job_name} (JobID: {row_object.job_id_with_array})"
+        )
         await self.app.bind_controller(self)
         await self.app.main_content_container.update(log_view)
 
 
-class NodeTableController(InteractiveTableController):
+class NodeTableController(InteractiveTableController[Node, SlurmControl]):
     model_class = NodeListModel
     theme_class = AppTheme
 
-    def __init__(self, app: App):
+    def __init__(self, app):
         super().__init__(app)
         self.bind("ctrl+r", "prompt_reboot_reason_selected_node(False)", "Reboot Node")
         self.bind("ctrl+x", "prompt_reboot_reason_selected_node(True)", "Force Reboot")
@@ -441,6 +466,8 @@ class NodeTableController(InteractiveTableController):
     async def action_prompt_reboot_reason_selected_node(self, force: bool):
         try:
             current_selection = self.view.selection_position
+            if current_selection is None:
+                raise IndexError
             selected_node = self.model.get_data_object_for_row(current_selection.row)
         except (AttributeError, IndexError):
             return await self.app.display_error("No Node selected")
