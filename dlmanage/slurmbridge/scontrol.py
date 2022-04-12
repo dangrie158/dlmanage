@@ -110,7 +110,8 @@ class SlurmControlObject(SlurmCLIObject[SlurmControlObjectType]):
                     object_attributes[attribute_name] = (
                         attribute_value[0] if len(attribute_value) == 1 else ""
                     )
-            all_objects.append(object_attributes)
+            if len(object_attributes) > 0:
+                all_objects.append(object_attributes)
 
         return all_objects
 
