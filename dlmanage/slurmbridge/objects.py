@@ -6,6 +6,7 @@ import dataclasses
 from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
+import re
 from typing import (
     Any,
     ClassVar,
@@ -333,15 +334,13 @@ class Node(SlurmControlObject["Node"]):
         if self.gres is None or self.gres_used is None:
             return ("n", "a")
 
-        # example gres string: "gpu:turing:4,gpu:ampere:4"
-        gres_entries = self.gres.split(",")
-        gres_used_entries = self.gres_used.split(",")
+        # example gres string: "gpu:turing:4(IDX:0,3)),gpu:ampere:4(None)"
+        extra_info_pattern = re.compile(r"\([^\)]*\)")
+        gres_entries = extra_info_pattern.sub("", self.gres).split(",")
+        gres_used_entries = extra_info_pattern.sub("", self.gres_used).split(",")
 
         avaliable_gpus = sum(int(entry.split(":")[-1]) for entry in gres_entries)
-        # example gres_used string: "gpu:turing:0(IDX:N/A)"
-        used_gpus = sum(
-            int(entry.split("(")[0].split(":")[-1]) for entry in gres_used_entries
-        )
+        used_gpus = sum(int(entry.split(":")[-1]) for entry in gres_used_entries)
         return str(used_gpus), str(avaliable_gpus)
 
     @cached_property
